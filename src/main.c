@@ -170,10 +170,49 @@ static void button_callback(uint gpio, uint32_t events) {
     recording = !recording;
 }
 
-// --- LED blink patterns ---
+// --- LED states ---
+
+typedef enum {
+    LED_OFF,          // vypnuto
+    LED_ON,           // trvale svítí – ready
+    LED_BLINK_SLOW,   // pomalé blikání (500 ms) – záznam
+    LED_BLINK_FAST,   // rychlé blikání (100 ms) – chyba MPU
+    LED_BLINK_FASTER, // rychlejší blikání (200 ms) – chyba flash
+} led_mode_t;
+
+static led_mode_t led_mode = LED_OFF;
+static uint32_t led_last_toggle_ms = 0;
 
 static void led_set(bool on) {
     gpio_put(LED_PIN, on);
+}
+
+static void led_update(void) {
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t interval = 0;
+
+    switch (led_mode) {
+        case LED_OFF:
+            led_set(false);
+            return;
+        case LED_ON:
+            led_set(true);
+            return;
+        case LED_BLINK_SLOW:
+            interval = 500;
+            break;
+        case LED_BLINK_FAST:
+            interval = 100;
+            break;
+        case LED_BLINK_FASTER:
+            interval = 200;
+            break;
+    }
+
+    if (now_ms - led_last_toggle_ms >= interval) {
+        led_last_toggle_ms = now_ms;
+        gpio_xor_mask(1u << LED_PIN);
+    }
 }
 
 // --- Main ---
@@ -205,22 +244,21 @@ int main(void) {
     // Init MPU-6500
     if (!mpu6500_init()) {
         printf("ERROR: MPU-6500 init failed (WHO_AM_I: 0x%02X)\n", mpu6500_who_am_i());
-        while (1) {
-            led_set(true); sleep_ms(100);
-            led_set(false); sleep_ms(100);
-        }
+        led_mode = LED_BLINK_FAST;
+        while (1) { led_update(); }
     }
     printf("MPU-6500 OK (WHO_AM_I: 0x%02X)\n", mpu6500_who_am_i());
 
     // Init W25Q64
     if (!w25q64_init()) {
         printf("ERROR: W25Q64 init failed (JEDEC: 0x%06X)\n", w25q64_read_jedec_id());
-        while (1) {
-            led_set(true); sleep_ms(200);
-            led_set(false); sleep_ms(200);
-        }
+        led_mode = LED_BLINK_FASTER;
+        while (1) { led_update(); }
     }
     printf("W25Q64 OK (JEDEC: 0x%06X)\n", w25q64_read_jedec_id());
+
+    // Ready – LED trvale svítí
+    led_mode = LED_ON;
 
     printf("Ready. Press button or type 'start' to begin recording.\n");
     printf("Commands: dump, erase, status, start, stop\n");
@@ -231,7 +269,6 @@ int main(void) {
     bool was_recording = false;
     uint64_t record_start_us = 0;
     uint64_t next_sample_us = 0;
-    uint32_t led_toggle_ms = 0;
 
     while (1) {
         // --- Check USB serial for commands ---
@@ -262,6 +299,7 @@ int main(void) {
             record_start_us = time_us_64();
             next_sample_us = record_start_us;
             was_recording = true;
+            led_mode = LED_BLINK_SLOW;
 
             printf("Recording at %d Hz. Press button or 'stop' to end.\n", SAMPLE_RATE_HZ);
         }
@@ -273,7 +311,7 @@ int main(void) {
             was_recording = false;
             printf("Recording stopped. %u samples saved.\n", num_samples);
             printf("Use 'dump' to download data as CSV.\n");
-            led_set(false);
+            led_mode = LED_ON;
         }
 
         // --- Sample data ---
@@ -311,13 +349,10 @@ int main(void) {
                 }
             }
 
-            // Blink LED while recording
-            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-            if (now_ms - led_toggle_ms >= 500) {
-                led_toggle_ms = now_ms;
-                gpio_xor_mask(1u << LED_PIN);
-            }
         }
+
+        // Aktualizace LED ve všech stavech
+        led_update();
     }
 
     return 0;
