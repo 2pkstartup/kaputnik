@@ -196,7 +196,9 @@ kaputnik/
 
 ## Odkazy
 https://www.waveshare.com/wiki/RP2040-Zero
+
 https://www.laskakit.cz/user/related_files/mpu-6500-datasheet2.pdf
+
 https://www.laskakit.cz/user/related_files/winbond-elec-w25q64fv.pdf
 
 ## Licence
