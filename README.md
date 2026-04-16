@@ -12,7 +12,7 @@ Cílem projektu je zaznamenávat letová data modelu rakety a v budoucnu detekov
 | IMU | MPU-6500 – 3-osý akcelerometr + gyroskop, SPI |
 | Flash | Winbond W25Q64FVSSIQ – 64 Mbit SPI flash |
 | Tlačítko | Start/stop záznamu (active low, interní pull-up) |
-| LED | Onboard LED – bliká při nahrávání |
+| LED | Onboard LED – indikuje stav přístroje |
 
 ### Zapojení pinů
 
