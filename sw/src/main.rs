@@ -1,3 +1,21 @@
+//! ==========================================================================
+//!  kaputnik-downloader – CLI nástroj pro Kaputnik flight logger
+//! ==========================================================================
+//!
+//!  Komunikuje s RP2040 firmware přes USB CDC sériovou linku.
+//!
+//!  Podporované příkazy:
+//!    dump   – stažení letových dat jako CSV (s progress barem)
+//!    status – zobrazení stavu zařízení (MPU, flash, čas, záznam)
+//!    erase  – smazání celé flash paměti
+//!    start  – spuštění záznamu vzdáleně
+//!    stop   – zastavení záznamu vzdáleně
+//!    sync   – synchronizace hodin (nastaví epoch čas na zařízení)
+//!    list   – výpis dostupných sériových portů
+//!
+//!  Výchozí port: /dev/ttyACM0, 115200 baud
+//!  Změna: kaputnik-downloader -p /dev/ttyACM1 status
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -5,15 +23,19 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// =========================================================================
+//  CLI definice (clap derive)
+// =========================================================================
+
 #[derive(Parser)]
 #[command(name = "kaputnik-downloader")]
 #[command(about = "Kaputnik flight data downloader")]
 struct Cli {
-    /// Serial port (e.g. /dev/ttyACM0)
+    /// Sériový port (např. /dev/ttyACM0)
     #[arg(short, long, default_value = "/dev/ttyACM0")]
     port: String,
 
-    /// Baud rate
+    /// Přenosová rychlost [baud]
     #[arg(short, long, default_value_t = 115200)]
     baud: u32,
 
@@ -23,26 +45,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Download flight data as CSV
+    /// Stáhnout letová data jako CSV
     Dump {
-        /// Output file (default: stdout)
+        /// Výstupní soubor (výchozí: stdout)
         #[arg(short, long)]
         output: Option<String>,
     },
-    /// Show device status
+    /// Zobrazit stav zařízení
     Status,
-    /// Erase flash memory
+    /// Smazat flash paměť
     Erase,
-    /// Start recording
+    /// Spustit záznam
     Start,
-    /// Stop recording
+    /// Zastavit záznam
     Stop,
-    /// Set device clock to current PC time
+    /// Synchronizovat hodiny zařízení s PC
     Sync,
-    /// List available serial ports
+    /// Vypsat dostupné sériové porty
     List,
 }
 
+// =========================================================================
+//  Pomocné funkce pro sériovou komunikaci
+// =========================================================================
+
+/// Otevře sériový port s daným názvem a rychlostí.
+/// Timeout 5 s – pokud zařízení neodpoví, operace selhá.
 fn open_port(port: &str, baud: u32) -> Result<Box<dyn serialport::SerialPort>> {
     serialport::new(port, baud)
         .timeout(Duration::from_secs(5))
@@ -50,6 +78,8 @@ fn open_port(port: &str, baud: u32) -> Result<Box<dyn serialport::SerialPort>> {
         .with_context(|| format!("Cannot open serial port {port}"))
 }
 
+/// Odešle textový příkaz na zařízení (ukončený \r\n).
+/// Po odeslání čeká 100 ms, aby firmware stihl příkaz zpracovat.
 fn send_command(port: &mut Box<dyn serialport::SerialPort>, cmd: &str) -> Result<()> {
     port.write_all(cmd.as_bytes())?;
     port.write_all(b"\r\n")?;
@@ -59,6 +89,8 @@ fn send_command(port: &mut Box<dyn serialport::SerialPort>, cmd: &str) -> Result
     Ok(())
 }
 
+/// Čte řádky z portu dokud nenarazí na "# END", timeout nebo EOF.
+/// Používá se pro jednoduché příkazy (status, erase, start, stop).
 fn read_lines(port: &mut Box<dyn serialport::SerialPort>) -> Result<Vec<String>> {
     let mut reader = BufReader::new(port.try_clone()?);
     let mut lines = Vec::new();
@@ -84,6 +116,17 @@ fn read_lines(port: &mut Box<dyn serialport::SerialPort>) -> Result<Vec<String>>
     Ok(lines)
 }
 
+// =========================================================================
+//  Příkaz: dump – stahování letových dat
+//
+//  Průběh:
+//  1. Pošle "dump" na zařízení
+//  2. Přečte hlavičkové řádky (začínají #) – z nich získá počet vzorků
+//  3. Přečte CSV hlavičku (epoch_ms,ax,ay,az,gx,gy,gz)
+//  4. Čte datové řádky s progress barem dokud nepřijde "# END"
+//  5. Zapisuje do souboru (-o) nebo na stdout
+// =========================================================================
+
 fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
     let mut port = open_port(port_name, baud)?;
 
@@ -96,11 +139,13 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
     let mut reader = BufReader::new(port.try_clone()?);
     let mut line = String::new();
 
-    // Parse header comments to get sample count for progress bar
+    // Parsování hlavičky – řádky začínající '#' jsou komentáře firmware,
+    // první řádek bez '#' je CSV hlavička (názvy sloupců)
     let mut total_samples: u64 = 0;
+    // Hlášky z hlavičky firmware
     let mut header_lines: Vec<String> = Vec::new();
 
-    // Read header lines (starting with #) and CSV header
+    // Čtení hlavičkových řádků (komentáře # a CSV header)
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -130,7 +175,7 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
         }
     }
 
-    // Open output
+    // Výstup – soubor nebo stdout
     let mut out: Box<dyn Write> = match &output {
         Some(path) => {
             eprintln!("Saving to {path}");
@@ -139,12 +184,12 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
         None => Box::new(std::io::stdout()),
     };
 
-    // Write header
+    // Zápis hlavičky do výstupu
     for hl in &header_lines {
         writeln!(out, "{hl}")?;
     }
 
-    // Progress bar
+    // Progress bar – zobrazí se jen při zápisu do souboru a známém počtu vzorků
     let pb = if total_samples > 0 && output.is_some() {
         let pb = ProgressBar::new(total_samples);
         pb.set_style(
@@ -157,7 +202,7 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
         None
     };
 
-    // Read data lines
+    // Čtení datových řádků CSV až do "# END"
     let mut count: u64 = 0;
     loop {
         line.clear();
@@ -188,6 +233,12 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
     Ok(())
 }
 
+// =========================================================================
+//  Příkaz: jednoduché operace (status, erase, start, stop)
+//
+//  Pošle příkaz a vypíše všechny řádky odpovědi.
+// =========================================================================
+
 fn cmd_simple(port_name: &str, baud: u32, cmd: &str) -> Result<()> {
     let mut port = open_port(port_name, baud)?;
     send_command(&mut port, cmd)?;
@@ -198,6 +249,13 @@ fn cmd_simple(port_name: &str, baud: u32, cmd: &str) -> Result<()> {
     }
     Ok(())
 }
+
+// =========================================================================
+//  Příkaz: sync – synchronizace hodin
+//
+//  Získá aktuální epoch sekundy z PC a pošle "settime <epoch>" na zařízení.
+//  RP2040 nemá RTC s baterií, takže čas se musí nastavit před každým letem.
+// =========================================================================
 
 fn cmd_sync(port_name: &str, baud: u32) -> Result<()> {
     let epoch_secs = SystemTime::now()
@@ -217,6 +275,13 @@ fn cmd_sync(port_name: &str, baud: u32) -> Result<()> {
     }
     Ok(())
 }
+
+// =========================================================================
+//  Příkaz: list – výpis sériových portů
+//
+//  Vypíše všechny dostupné porty s typem (USB/PCI/Bluetooth).
+//  Užitečné pro nalezení správného /dev/ttyACMx.
+// =========================================================================
 
 fn cmd_list() -> Result<()> {
     let ports = serialport::available_ports().context("Cannot list serial ports")?;
@@ -240,6 +305,10 @@ fn cmd_list() -> Result<()> {
     }
     Ok(())
 }
+
+// =========================================================================
+//  Vstupní bod – parsování CLI argumentů a dispatch příkazů
+// =========================================================================
 
 fn main() -> Result<()> {
     let cli = Cli::parse();

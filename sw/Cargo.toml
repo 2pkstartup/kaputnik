@@ -1,3 +1,11 @@
+# ==========================================================================
+#  kaputnik-downloader – PC CLI nástroj pro Kaputnik flight logger
+#
+#  Komunikuje s firmware přes USB sériovou linku (CDC ACM).
+#  Umožňuje stahování letových dat, ovládání záznamu,
+#  synchronizaci hodin a správu flash paměti.
+# ==========================================================================
+
 [package]
 name = "kaputnik-downloader"
 version = "0.1.0"
@@ -5,8 +13,8 @@ edition = "2024"
 description = "Kaputnik flight data downloader"
 
 [dependencies]
-serialport = "4"
-clap = { version = "4", features = ["derive"] }
-csv = "1"
-anyhow = "1"
-indicatif = "0.17"
+serialport = "4"                              # Sériová komunikace (POSIX/Windows)
+clap = { version = "4", features = ["derive"] } # CLI parser s derive makry
+csv = "1"                                      # CSV čtení/zápis (zatím nepřímo použito)
+anyhow = "1"                                   # Zjednodušená propagace chyb
+indicatif = "0.17"                             # Progress bar pro stahování dat
