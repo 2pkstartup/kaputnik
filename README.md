@@ -56,21 +56,25 @@ Připojte se sériovým terminálem (115200 baud):
 | `dump` | Vypíše data jako CSV |
 | `erase` | Smaže celou flash |
 | `status` | Zobrazí stav zařízení |
+| `settime <epoch_sec>` | Nastaví vnitřní hodiny (epoch sekundy) |
 
 ### CSV formát výstupu
 
 ```
-# KAPUTNIK Flight Data v1
+# KAPUTNIK Flight Data v2
 # Sample rate: 500 Hz
 # Samples: 12345
 # Accel range: +/-16 g
 # Gyro range: +/-2000 dps
-timestamp_us,ax,ay,az,gx,gy,gz
-0,123,-456,16384,10,-5,2
-2000,125,-460,16380,12,-3,1
+# Epoch start: 1776556800000
+epoch_ms,ax,ay,az,gx,gy,gz
+1776556800000,123,-456,16384,10,-5,2
+1776556800002,125,-460,16380,12,-3,1
 ...
 # END
 ```
+
+Každý záznam obsahuje absolutní časový otisk `epoch_ms` (milisekundy od 1.1.1970). Vyžaduje synchronizaci hodin před záznamem.
 
 ## Nastavení MPU-6500
 
@@ -136,9 +140,30 @@ kaputnik-downloader -p /dev/ttyACM0 stop
 
 # Smazání flash
 kaputnik-downloader -p /dev/ttyACM0 erase
+
+# Synchronizace hodin (nastaví čas zařízení na aktuální čas PC)
+kaputnik-downloader -p /dev/ttyACM0 sync
 ```
 
 Výchozí port je `/dev/ttyACM0`, lze změnit přepínačem `-p`.
+
+### Typický workflow před letem
+
+```bash
+# 1. Synchronizace hodin
+kaputnik-downloader sync
+
+# 2. Spuštění záznamu (nebo tlačítkem na desce)
+kaputnik-downloader start
+
+# 3. ...let...
+
+# 4. Zastavení záznamu (nebo tlačítkem)
+kaputnik-downloader stop
+
+# 5. Stažení dat
+kaputnik-downloader dump -o flight.csv
+```
 
 ## Struktura projektu
 
