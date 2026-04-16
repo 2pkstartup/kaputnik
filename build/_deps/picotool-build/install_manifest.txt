@@ -1,0 +1,7 @@
+/home/herzog/_dev/esp/kaputnik/build/_deps/picotool/picotool
+/home/herzog/_dev/esp/kaputnik/build/_deps/picotool/picotoolTargets.cmake
+/home/herzog/_dev/esp/kaputnik/build/_deps/picotool/picotoolTargets-release.cmake
+/home/herzog/_dev/esp/kaputnik/build/_deps/picotool/picotoolConfig.cmake
+/home/herzog/_dev/esp/kaputnik/build/_deps/picotool/picotoolConfigVersion.cmake
+/home/herzog/_dev/esp/kaputnik/build/_deps/picotool/enc_bootloader.elf
+/home/herzog/_dev/esp/kaputnik/build/_deps/picotool/enc_bootloader_mbedtls.elf
