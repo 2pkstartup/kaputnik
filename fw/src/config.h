@@ -45,6 +45,6 @@
 
 // --- Data record magic ---
 #define DATA_MAGIC  0x5550414B  // "KAPU"
-#define DATA_VERSION 1
+#define DATA_VERSION 2
 
 #endif // CONFIG_H

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "kaputnik-downloader")]
@@ -37,6 +37,8 @@ enum Commands {
     Start,
     /// Stop recording
     Stop,
+    /// Set device clock to current PC time
+    Sync,
     /// List available serial ports
     List,
 }
@@ -197,6 +199,25 @@ fn cmd_simple(port_name: &str, baud: u32, cmd: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_sync(port_name: &str, baud: u32) -> Result<()> {
+    let epoch_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock error")?
+        .as_secs();
+
+    let cmd = format!("settime {epoch_secs}");
+    eprintln!("Setting device clock to epoch {epoch_secs}...");
+
+    let mut port = open_port(port_name, baud)?;
+    send_command(&mut port, &cmd)?;
+
+    let lines = read_lines(&mut port)?;
+    for line in &lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn cmd_list() -> Result<()> {
     let ports = serialport::available_ports().context("Cannot list serial ports")?;
     if ports.is_empty() {
@@ -232,6 +253,7 @@ fn main() -> Result<()> {
         }
         Commands::Start => cmd_simple(&cli.port, cli.baud, "start"),
         Commands::Stop => cmd_simple(&cli.port, cli.baud, "stop"),
+        Commands::Sync => cmd_sync(&cli.port, cli.baud),
         Commands::List => cmd_list(),
     }
 }

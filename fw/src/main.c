@@ -26,7 +26,8 @@ typedef struct __attribute__((packed)) {
     uint32_t num_samples;
     uint32_t accel_range;    // full scale in g
     uint32_t gyro_range;     // full scale in dps
-    uint8_t  reserved[256 - 24];
+    uint64_t epoch_ms_start; // epoch ms when recording started (0 if time not set)
+    uint8_t  reserved[256 - 32];
 } flash_header_t;            // 256 bytes = 1 page
 
 _Static_assert(sizeof(flash_header_t) == 256, "flash_header_t must be 256 bytes");
@@ -36,6 +37,15 @@ _Static_assert(sizeof(flash_header_t) == 256, "flash_header_t must be 256 bytes"
 static volatile bool recording = false;
 static uint32_t num_samples = 0;
 static uint32_t flash_write_addr = 0;
+
+// Epoch time offset: epoch_ms = ms_since_boot + epoch_offset_ms
+static int64_t epoch_offset_ms = 0;
+static bool time_is_set = false;
+static uint64_t record_epoch_ms_start = 0;
+
+static uint64_t get_epoch_ms(void) {
+    return (uint64_t)((int64_t)to_ms_since_boot(get_absolute_time()) + epoch_offset_ms);
+}
 
 // Page buffer for batching writes (256 bytes = 16 records)
 static uint8_t page_buf[FLASH_PAGE_SIZE];
@@ -81,6 +91,7 @@ static void write_header(void) {
     hdr.num_samples = num_samples;
     hdr.accel_range = MPU_ACCEL_RANGE_G;
     hdr.gyro_range = MPU_GYRO_RANGE_DPS;
+    hdr.epoch_ms_start = record_epoch_ms_start;
 
     // Erase first sector (contains header)
     w25q64_sector_erase(0);
@@ -105,14 +116,16 @@ static void process_command(const char *cmd) {
         printf("# Samples: %u\n", hdr.num_samples);
         printf("# Accel range: +/-%u g\n", hdr.accel_range);
         printf("# Gyro range: +/-%u dps\n", hdr.gyro_range);
-        printf("timestamp_us,ax,ay,az,gx,gy,gz\n");
+        printf("# Epoch start: %llu\n", hdr.epoch_ms_start);
+        printf("epoch_ms,ax,ay,az,gx,gy,gz\n");
 
         uint32_t addr = FLASH_DATA_START;
         sample_record_t rec;
         for (uint32_t i = 0; i < hdr.num_samples; i++) {
             w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
-            printf("%u,%d,%d,%d,%d,%d,%d\n",
-                   rec.timestamp_us,
+            uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
+            printf("%llu,%d,%d,%d,%d,%d,%d\n",
+                   epoch_ms,
                    rec.ax, rec.ay, rec.az,
                    rec.gx, rec.gy, rec.gz);
             addr += sizeof(rec);
@@ -133,6 +146,10 @@ static void process_command(const char *cmd) {
         w25q64_read(0, (uint8_t *)&hdr, sizeof(hdr));
 
         printf("Recording: %s\n", recording ? "YES" : "NO");
+        printf("Time set: %s\n", time_is_set ? "YES" : "NO");
+        if (time_is_set) {
+            printf("Current epoch ms: %llu\n", get_epoch_ms());
+        }
         if (hdr.magic == DATA_MAGIC) {
             printf("Flash data: %u samples @ %u Hz\n", hdr.num_samples, hdr.sample_rate_hz);
         } else {
@@ -153,8 +170,24 @@ static void process_command(const char *cmd) {
             printf("Recording stopped via USB\n");
         }
 
+    } else if (strlen(cmd) > 7 && strncmp(cmd, "settime ", 7) == 0) {
+        // Parse epoch seconds from command
+        uint64_t epoch_sec = 0;
+        const char *p = cmd + 7;
+        while (*p >= '0' && *p <= '9') {
+            epoch_sec = epoch_sec * 10 + (*p - '0');
+            p++;
+        }
+        if (epoch_sec > 1000000000ULL) { // sanity: after 2001
+            epoch_offset_ms = (int64_t)(epoch_sec * 1000ULL) - (int64_t)to_ms_since_boot(get_absolute_time());
+            time_is_set = true;
+            printf("Time set. Epoch ms: %llu\n", get_epoch_ms());
+        } else {
+            printf("ERROR: Invalid epoch (use seconds since 1970)\n");
+        }
+
     } else if (strlen(cmd) > 0) {
-        printf("Commands: dump, erase, status, start, stop\n");
+        printf("Commands: dump, erase, status, start, stop, settime <epoch_sec>\n");
     }
 }
 
@@ -261,7 +294,10 @@ int main(void) {
     led_mode = LED_ON;
 
     printf("Ready. Press button or type 'start' to begin recording.\n");
-    printf("Commands: dump, erase, status, start, stop\n");
+    printf("Commands: dump, erase, status, start, stop, settime <epoch_sec>\n");
+    if (!time_is_set) {
+        printf("WARNING: Time not set. Use 'settime <epoch_sec>' to set clock.\n");
+    }
 
     // --- Main loop ---
     char cmd_buf[64];
@@ -296,6 +332,7 @@ int main(void) {
             num_samples = 0;
             flash_write_addr = FLASH_DATA_START;
             page_buf_pos = 0;
+            record_epoch_ms_start = time_is_set ? get_epoch_ms() : 0;
             record_start_us = time_us_64();
             next_sample_us = record_start_us;
             was_recording = true;
