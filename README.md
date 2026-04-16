@@ -36,6 +36,15 @@ Cílem projektu je zaznamenávat letová data modelu rakety a v budoucnu detekov
 - Opětovný stisk tlačítka nebo příkaz `stop` zastaví záznam
 - Přes USB sériovou linku lze data stáhnout jako **CSV**
 
+### LED indikace
+
+| LED | Stav |
+|---|---|
+| Trvale svítí | Připraveno (ready) |
+| Bliká pomalu (500 ms) | Probíhá záznam |
+| Bliká rychle (100 ms) | Chyba MPU-6500 |
+| Bliká rychleji (200 ms) | Chyba W25Q64 flash |
+
 ### USB příkazy
 
 Připojte se sériovým terminálem (115200 baud):
@@ -74,30 +83,80 @@ timestamp_us,ax,ay,az,gx,gy,gz
 
 ## Build
 
-Vyžaduje [Pico SDK](https://github.com/raspberrypi/pico-sdk) nainstalované v `~/pico/pico-sdk`.
+### Firmware (fw/)
+
+Vyžaduje [Pico SDK](https://github.com/raspberrypi/pico-sdk) nainstalované v `~/pico/pico-sdk` a ARM toolchain (`arm-none-eabi-gcc`).
 
 ```bash
+cd fw
 mkdir -p build && cd build
 cmake ..
 make -j$(nproc)
 ```
 
-Výstupem je `build/kaputnik.uf2`.
+Výstupem je `fw/build/kaputnik.uf2`.
+
+### PC aplikace (sw/)
+
+Vyžaduje [Rust](https://rustup.rs/) toolchain.
+
+```bash
+cd sw
+cargo build --release
+```
+
+Výstupem je `sw/target/release/kaputnik-downloader`.
 
 ## Nahrání firmware
 
 1. Podržte tlačítko **BOOTSEL** na RP2040
 2. Připojte USB kabel
-3. Nakopírujte `kaputnik.uf2` na USB disk, který se objeví
+3. Nakopírujte `fw/build/kaputnik.uf2` na USB disk, který se objeví
+
+## PC aplikace – kaputnik-downloader
+
+Rust CLI nástroj pro komunikaci s Kaputnikem přes USB sériovou linku.
+
+```bash
+# Výpis dostupných sériových portů
+kaputnik-downloader list
+
+# Stav zařízení
+kaputnik-downloader -p /dev/ttyACM0 status
+
+# Stáhnutí dat do CSV souboru
+kaputnik-downloader -p /dev/ttyACM0 dump -o flight.csv
+
+# Stáhnutí dat na stdout
+kaputnik-downloader -p /dev/ttyACM0 dump
+
+# Spuštění / zastavení záznamu
+kaputnik-downloader -p /dev/ttyACM0 start
+kaputnik-downloader -p /dev/ttyACM0 stop
+
+# Smazání flash
+kaputnik-downloader -p /dev/ttyACM0 erase
+```
+
+Výchozí port je `/dev/ttyACM0`, lze změnit přepínačem `-p`.
 
 ## Struktura projektu
 
 ```
-src/
-├── config.h      – definice pinů, parametry snímání
-├── main.c        – hlavní logika (záznam, USB příkazy)
-├── mpu6500.h/c   – SPI driver pro MPU-6500
-└── w25q64.h/c    – SPI driver pro W25Q64 flash
+kaputnik/
+├── fw/                          ← firmware pro RP2040
+│   ├── CMakeLists.txt
+│   ├── pico_sdk_import.cmake
+│   └── src/
+│       ├── config.h             – definice pinů, parametry snímání
+│       ├── main.c               – hlavní logika (záznam, USB příkazy, LED)
+│       ├── mpu6500.h/c          – SPI driver pro MPU-6500
+│       └── w25q64.h/c           – SPI driver pro W25Q64 flash
+├── sw/                          ← PC aplikace (Rust)
+│   ├── Cargo.toml
+│   └── src/main.rs              – CLI downloader
+├── .gitignore
+└── README.md
 ```
 
 ## Plánovaný vývoj
@@ -106,6 +165,7 @@ src/
 - [ ] Detekce horní úvrati (apogee)
 - [ ] Automatické vypuštění padáku (GP16)
 - [ ] Kalibrace akcelerometru před startem
+- [ ] Vizualizace dat (grafy v PC aplikaci)
 
 ## Licence
 
