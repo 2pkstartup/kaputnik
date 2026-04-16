@@ -32,7 +32,7 @@
  *
  *  Ovládání:
  *      GP15 ── Tlačítko start/stop záznamu (active low, interní pull-up)
- *      GP14 ── Padákový výstup (budoucí – GPIO output, active high)
+ *      GP14 ── Padákový výstup (GPIO output, active high, 1 s puls)
  *
  *  Onboard:
  *      GP16 ── WS2812B RGB LED (řízeno přes PIO)
@@ -69,8 +69,24 @@
  *
  *      Zelená (svítí)           – připraveno (ready)
  *      Modrá (bliká 500 ms)    – probíhá záznam
+ *      Fialová (bliká 300 ms)  – apogee detekováno, padák aktivován
  *      Červená (bliká 100 ms)  – chyba MPU-6500
  *      Žlutá (bliká 200 ms)   – chyba W25Q64 flash
+ *
+ * --------------------------------------------------------------------------
+ *  EMA FILTR A DETEKCE APOGEA
+ * --------------------------------------------------------------------------
+ *
+ *  Surová data z IMU jsou vyhlazena exponenciálním klouzavým průměrem (EMA),
+ *  který odstraní vibrace motoru a strukturální rezonance trupu rakety.
+ *  Filtrovaná Z-osa akcelerometru se používá pro detekci fází letu:
+ *
+ *      IDLE      → čeká se na startu (baseline az ≈ +1g)
+ *      LAUNCHED  → tah motoru detekován (az > baseline + 3g)
+ *      APOGEE    → rychlost klesla pod nulu → padák aktivován
+ *
+ *  Rychlost se odhaduje numerickou integrací filtrovaného zrychlení
+ *  (po odečtení gravitační složky).
  *
  * --------------------------------------------------------------------------
  *  Licence:    MIT
@@ -132,6 +148,63 @@ _Static_assert(sizeof(flash_header_t) == 256, "flash_header_t must be 256 bytes"
 static volatile bool recording = false;    /* true = probíhá záznam (nastavuje ISR i USB) */
 static uint32_t num_samples = 0;           /* Počet dosud zaznamenaných vzorků              */
 static uint32_t flash_write_addr = 0;      /* Aktuální adresa pro zápis na flash            */
+
+/* =======================================================================
+ *  EMA (Exponenciální klouzavý průměr)
+ *
+ *  Vyhlazuje surová IMU data a odstraňuje vysokofrekvenční vibrace.
+ *  Filtr běží na všech 6 osách, ale pro detekci apogea se primárně
+ *  používá filtrovaná Z-osa akcelerometru.
+ *
+ *  Vzorec:  ema[n] = α · raw[n] + (1 − α) · ema[n−1]
+ * ======================================================================= */
+static float ema_ax = 0, ema_ay = 0, ema_az = 0;  /* Filtrovaný accel [LSB] */
+static float ema_gx = 0, ema_gy = 0, ema_gz = 0;  /* Filtrovaný gyro  [LSB] */
+static bool ema_initialized = false;               /* false = první vzorek   */
+
+/* Aktualizuje EMA filtr na všech 6 osách. Při prvním volání inicializuje
+ * stav filtru přímo na vstupní hodnotu (bez přechodového jevu). */
+static void ema_update(const mpu6500_data_t *d) {
+    if (!ema_initialized) {
+        ema_ax = d->accel_x; ema_ay = d->accel_y; ema_az = d->accel_z;
+        ema_gx = d->gyro_x;  ema_gy = d->gyro_y;  ema_gz = d->gyro_z;
+        ema_initialized = true;
+        return;
+    }
+    const float a = EMA_ALPHA;
+    ema_ax = a * d->accel_x + (1 - a) * ema_ax;
+    ema_ay = a * d->accel_y + (1 - a) * ema_ay;
+    ema_az = a * d->accel_z + (1 - a) * ema_az;
+    ema_gx = a * d->gyro_x  + (1 - a) * ema_gx;
+    ema_gy = a * d->gyro_y  + (1 - a) * ema_gy;
+    ema_gz = a * d->gyro_z  + (1 - a) * ema_gz;
+}
+
+/* =======================================================================
+ *  Detekce fází letu a apogea
+ *
+ *  Stavový automat:
+ *    FLIGHT_IDLE     – raketa stojí na rampě, měří se baseline az
+ *    FLIGHT_LAUNCHED – tah motoru detekován, integruje se rychlost
+ *    FLIGHT_APOGEE   – rychlost ≤ 0, padák aktivován
+ *
+ *  Rychlost se odhaduje integrací filtrovaného az (po odečtení
+ *  klidové hodnoty / gravitace) metodou obdélníkové integrace.
+ * ======================================================================= */
+typedef enum {
+    FLIGHT_IDLE,       /* Na rampě – čeká na start                       */
+    FLIGHT_LAUNCHED,   /* Let – motor / coast fáze                        */
+    FLIGHT_APOGEE,     /* Apogee detekováno – padák aktivován             */
+} flight_state_t;
+
+static flight_state_t flight_state = FLIGHT_IDLE;
+static float baseline_az = 0;       /* Klidová hodnota az [LSB] (≈ +1g)     */
+static float est_velocity = 0;      /* Odhadovaná svislá rychlost [m/s]     */
+static uint32_t launch_detect_ms = 0;   /* Čas první detekce tahu [ms]      */
+static uint32_t apogee_detect_ms = 0;   /* Čas první detekce apogee [ms]    */
+static uint32_t flight_start_ms = 0;    /* Čas potvrzeného startu [ms]      */
+static bool parachute_fired = false;    /* Padák byl aktivován (jednorázově) */
+static uint32_t parachute_off_ms = 0;   /* Čas deaktivace padákového pinu   */
 
 /*
  * Epoch čas – RP2040 nemá RTC s baterií, proto se čas nastavuje
@@ -343,6 +416,7 @@ typedef enum {
     LED_BLINK_SLOW,   /* Modrá, bliká 500 ms – probíhá záznam            */
     LED_BLINK_FAST,   /* Červená, bliká 100 ms – chyba inicializace MPU  */
     LED_BLINK_FASTER, /* Žlutá, bliká 200 ms – chyba inicializace flash  */
+    LED_BLINK_APOGEE, /* Fialová, bliká 300 ms – apogee detekováno       */
 } led_mode_t;
 
 static led_mode_t led_mode = LED_OFF;       /* Aktuální režim LED       */
@@ -356,6 +430,7 @@ static uint32_t led_mode_color(void) {
         case LED_BLINK_SLOW:   return ws2812_rgb(0, 0, 40);    // blue
         case LED_BLINK_FAST:   return ws2812_rgb(40, 0, 0);    // red
         case LED_BLINK_FASTER: return ws2812_rgb(40, 30, 0);   // yellow
+        case LED_BLINK_APOGEE: return ws2812_rgb(40, 0, 40);   // purple
         default:               return 0;
     }
 }
@@ -382,6 +457,9 @@ static void led_update(void) {
             break;
         case LED_BLINK_FASTER:
             interval = 200;
+            break;
+        case LED_BLINK_APOGEE:
+            interval = 300;
             break;
     }
 
@@ -467,6 +545,23 @@ int main(void) {
     uint64_t record_start_us = 0;  /* Čas startu záznamu [µs]              */
     uint64_t next_sample_us = 0;   /* Čas příštího vzorku [µs]             */
 
+    /* Kalibrace baseline – změříme klidovou hodnotu az ještě před
+     * zahájením záznamu (raketa stojí na rampě, az ≈ +1g). */
+    {
+        printf("Calibrating baseline (hold still)...\n");
+        float sum_az = 0;
+        const int CAL_SAMPLES = 200; /* 200 vzorků = 0.4 s */
+        for (int i = 0; i < CAL_SAMPLES; i++) {
+            mpu6500_data_t cal;
+            mpu6500_read_all(&cal);
+            sum_az += cal.accel_z;
+            sleep_ms(2);
+        }
+        baseline_az = sum_az / CAL_SAMPLES;
+        printf("Baseline az = %.1f LSB (%.2f g)\n",
+               baseline_az, baseline_az / ACCEL_LSB_PER_G);
+    }
+
     while (1) {
         // --- Check USB serial for commands ---
         int ch = getchar_timeout_us(0);
@@ -499,6 +594,15 @@ int main(void) {
             was_recording = true;
             led_mode = LED_BLINK_SLOW;
 
+            /* Reset stavu letu a EMA filtru pro nový záznam */
+            flight_state = FLIGHT_IDLE;
+            est_velocity = 0;
+            launch_detect_ms = 0;
+            apogee_detect_ms = 0;
+            flight_start_ms = 0;
+            parachute_fired = false;
+            ema_initialized = false;
+
             printf("Recording at %d Hz. Press button or 'stop' to end.\n", SAMPLE_RATE_HZ);
         }
 
@@ -527,6 +631,75 @@ int main(void) {
                 mpu6500_data_t mpu_data;
                 mpu6500_read_all(&mpu_data);
 
+                /* -- EMA filtr – vyhlazení surových dat --------------------- */
+                ema_update(&mpu_data);
+
+                /* -- Detekce fází letu (state machine) ---------------------- */
+                uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+                float delta_az_g = (ema_az - baseline_az) / ACCEL_LSB_PER_G;
+                const float dt = 1.0f / SAMPLE_RATE_HZ;
+
+                switch (flight_state) {
+                case FLIGHT_IDLE:
+                    /* Čeká se na detekci tahu motoru.
+                     * Podmínka: filtrované zrychlení > baseline + LAUNCH_ACCEL_G
+                     * po dobu LAUNCH_CONFIRM_MS. */
+                    if (delta_az_g > LAUNCH_ACCEL_G) {
+                        if (launch_detect_ms == 0) launch_detect_ms = now_ms;
+                        if (now_ms - launch_detect_ms >= LAUNCH_CONFIRM_MS) {
+                            flight_state = FLIGHT_LAUNCHED;
+                            flight_start_ms = now_ms;
+                            est_velocity = 0;
+                            printf("LAUNCH detected! (az=%.1fg)\n", delta_az_g);
+                        }
+                    } else {
+                        launch_detect_ms = 0; /* Reset – nebyl trvalý tah */
+                    }
+                    break;
+
+                case FLIGHT_LAUNCHED:
+                    /* Integrace zrychlení → odhad rychlosti [m/s].
+                     * delta_az_g je zrychlení v g nad klidovým stavem,
+                     * převedeme na m/s² (* 9.81) a integrujeme (× dt). */
+                    est_velocity += delta_az_g * 9.81f * dt;
+
+                    /* Apogee detekce – rychlost klesla pod nulu.
+                     * Bezpečnostní podmínky:
+                     *   1. Min. doba letu (APOGEE_MIN_FLIGHT_MS)
+                     *   2. Rychlost ≤ 0 po dobu APOGEE_VEL_CONFIRM_MS */
+                    if (now_ms - flight_start_ms >= APOGEE_MIN_FLIGHT_MS) {
+                        if (est_velocity <= 0) {
+                            if (apogee_detect_ms == 0) apogee_detect_ms = now_ms;
+                            if (now_ms - apogee_detect_ms >= APOGEE_VEL_CONFIRM_MS) {
+                                flight_state = FLIGHT_APOGEE;
+                                printf("APOGEE detected at T+%lu ms!\n",
+                                       now_ms - flight_start_ms);
+
+                                /* Aktivace padáku */
+                                if (!parachute_fired) {
+                                    gpio_put(PARACHUTE_PIN, 1);
+                                    parachute_off_ms = now_ms + PARACHUTE_ACTIVE_MS;
+                                    parachute_fired = true;
+                                    led_mode = LED_BLINK_APOGEE;
+                                    printf("PARACHUTE fired!\n");
+                                }
+                            }
+                        } else {
+                            apogee_detect_ms = 0; /* Reset – stále stoupá */
+                        }
+                    }
+                    break;
+
+                case FLIGHT_APOGEE:
+                    /* Po detekci apogea – deaktivace padákového pinu po
+                     * uplynutí PARACHUTE_ACTIVE_MS */
+                    if (parachute_fired && now_ms >= parachute_off_ms) {
+                        gpio_put(PARACHUTE_PIN, 0);
+                    }
+                    break;
+                }
+
+                /* -- Záznam surových dat na flash (nefiltrovaná!) ---------- */
                 sample_record_t rec;
                 rec.timestamp_us = (uint32_t)(now_us - record_start_us);
                 rec.ax = mpu_data.accel_x;

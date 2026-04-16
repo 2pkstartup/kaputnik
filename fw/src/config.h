@@ -73,6 +73,32 @@
 #define FLASH_MAX_RECORDS   ((FLASH_TOTAL_SIZE - FLASH_DATA_START) / sizeof(sample_record_t))
 
 /* -----------------------------------------------------------------------
+ *  EMA filtr a detekce apogea
+ *
+ *  Exponenciální klouzavý průměr (EMA) vyhlazuje surová data z IMU,
+ *  čímž odstraní vibrace motoru a strukturální rezonance:
+ *
+ *      ema[n] = α · raw[n] + (1 − α) · ema[n−1]
+ *
+ *  Nižší α = hladší výstup, ale pomalejší odezva.
+ *  α = 0.02 při 500 Hz → mezní frekvence cca 1.6 Hz.
+ *
+ *  Detekce apogea:
+ *    1. Snímá se baseline az na zemi (~ +1g)
+ *    2. Start letu: filtrovaný az > baseline + LAUNCH_ACCEL_G
+ *    3. Numerická integrace (az − baseline) → odhadovaná rychlost
+ *    4. Apogee = rychlost klesne z kladné pod nulu
+ *    5. Aktivace padákového pinu
+ * ----------------------------------------------------------------------- */
+#define EMA_ALPHA             0.02f   /* Vyhlazovací koeficient EMA          */
+#define LAUNCH_ACCEL_G        3.0f    /* Práh detekce startu [g nad klidem]  */
+#define LAUNCH_CONFIRM_MS     50      /* Potvrzení startu – min. doba [ms]   */
+#define APOGEE_MIN_FLIGHT_MS  500     /* Min. doba letu před detekcí apogea  */
+#define APOGEE_VEL_CONFIRM_MS 50      /* Rychlost ≤ 0 po tuto dobu → apogee */
+#define PARACHUTE_ACTIVE_MS   1000    /* Doba aktivace padákového pinu [ms]  */
+#define ACCEL_LSB_PER_G       2048.0f /* LSB/g při ±16g (32768/16)           */
+
+/* -----------------------------------------------------------------------
  *  Identifikace datového formátu
  * ----------------------------------------------------------------------- */
 #define DATA_MAGIC  0x5550414B  /* ASCII "KAPU" (little-endian)              */
