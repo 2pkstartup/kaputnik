@@ -1,3 +1,82 @@
+/*
+ * ==========================================================================
+ *  KAPUTNIK – Flight Data Logger pro modelářské rakety
+ * ==========================================================================
+ *
+ *  Projekt:    Kaputnik
+ *  Soubor:     main.c
+ *  Popis:      Hlavní řídicí smyčka firmware – inicializace hardware,
+ *              záznam letových dat z IMU na externí flash paměť,
+ *              USB sériová komunikace pro stahování dat a ovládání.
+ *
+ *  MCU:        RP2040 (Waveshare RP2040-Zero)
+ *  IMU:        InvenSense MPU-6500  (3-osý akcelerometr + gyroskop, SPI)
+ *  Flash:      Winbond W25Q64FVSSIQ (64 Mbit / 8 MB, SPI)
+ *  LED:        WS2812B RGB NeoPixel (onboard na RP2040-Zero, PIO)
+ *
+ * --------------------------------------------------------------------------
+ *  ZAPOJENÍ PINŮ  (Waveshare RP2040-Zero)
+ * --------------------------------------------------------------------------
+ *
+ *  MPU-6500 (SPI0):
+ *      GP2  ── SCK   (SPI0 SCK)
+ *      GP3  ── MOSI  (SPI0 TX)
+ *      GP4  ── MISO  (SPI0 RX)
+ *      GP5  ── CS    (GPIO, active low)
+ *
+ *  W25Q64 Flash (SPI1):
+ *      GP10 ── SCK   (SPI1 SCK)
+ *      GP11 ── MOSI  (SPI1 TX)
+ *      GP12 ── MISO  (SPI1 RX)
+ *      GP13 ── CS    (GPIO, active low)
+ *
+ *  Ovládání:
+ *      GP15 ── Tlačítko start/stop záznamu (active low, interní pull-up)
+ *      GP14 ── Padákový výstup (budoucí – GPIO output, active high)
+ *
+ *  Onboard:
+ *      GP16 ── WS2812B RGB LED (řízeno přes PIO)
+ *      USB-C ── CDC sériová linka (115200 baud)
+ *
+ * --------------------------------------------------------------------------
+ *  FORMÁT DAT NA FLASH
+ * --------------------------------------------------------------------------
+ *
+ *  Stránka 0 (256 B):  flash_header_t – magic, verze, počet vzorků, epoch
+ *  Stránky 1+:         sample_record_t – 16 B na záznam, 16 záznamů/stránka
+ *
+ *  Jeden záznam (16 B, packed):
+ *      uint32_t timestamp_us   – čas od začátku záznamu [µs]
+ *      int16_t  ax, ay, az     – raw akcelerometr (±16g → ±32768)
+ *      int16_t  gx, gy, gz     – raw gyroskop (±2000°/s → ±32768)
+ *
+ *  Kapacita: ~500 000 vzorků ≈ 16 minut při 500 Hz
+ *
+ * --------------------------------------------------------------------------
+ *  USB PŘÍKAZY (sériový terminál 115200 baud)
+ * --------------------------------------------------------------------------
+ *
+ *      start              – spustit záznam
+ *      stop               – zastavit záznam
+ *      dump               – vypsat data jako CSV (epoch_ms,ax,ay,az,gx,gy,gz)
+ *      erase              – smazat celou flash
+ *      status             – stav zařízení (MPU, flash, čas, záznam)
+ *      settime <epoch_s>  – nastavit vnitřní hodiny (epoch sekundy od 1970)
+ *
+ * --------------------------------------------------------------------------
+ *  LED INDIKACE (WS2812B RGB)
+ * --------------------------------------------------------------------------
+ *
+ *      Zelená (svítí)           – připraveno (ready)
+ *      Modrá (bliká 500 ms)    – probíhá záznam
+ *      Červená (bliká 100 ms)  – chyba MPU-6500
+ *      Žlutá (bliká 200 ms)   – chyba W25Q64 flash
+ *
+ * --------------------------------------------------------------------------
+ *  Licence:    MIT
+ * ==========================================================================
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
@@ -8,51 +87,79 @@
 #include "config.h"
 #include "mpu6500.h"
 #include "w25q64.h"
+#include "ws2812.h"
 
-// --- Data structures stored on flash ---
+/* =======================================================================
+ *  Datové struktury ukládané na flash
+ * =======================================================================
+ *
+ *  Flash layout:
+ *    Adresa 0x000000 .. 0x0000FF  →  flash_header_t (1 stránka = 256 B)
+ *    Adresa 0x000100 .. 0x7FFFFF  →  sample_record_t (16 B × N)
+ *
+ *  Každá stránka (256 B) pojme přesně 16 záznamů.
+ *  Zápis probíhá stránkově – záznamy se bufferují v RAM a zapisují
+ *  najednou po naplnění 256B bufferu.
+ * ======================================================================= */
 
+/* Jeden vzorek letových dat – 16 bytů, packed pro přesné zarovnání na flash */
 typedef struct __attribute__((packed)) {
-    uint32_t timestamp_us;  // microseconds since recording start
-    int16_t  ax, ay, az;    // raw accelerometer
-    int16_t  gx, gy, gz;    // raw gyroscope
-} sample_record_t;          // 16 bytes
+    uint32_t timestamp_us;  /* Čas od začátku záznamu [µs]                   */
+    int16_t  ax, ay, az;    /* Raw akcelerometr (LSB, ±16g → ±32768)         */
+    int16_t  gx, gy, gz;    /* Raw gyroskop     (LSB, ±2000°/s → ±32768)     */
+} sample_record_t;          /* Celkem: 4 + 6×2 = 16 bytů                     */
 
 _Static_assert(sizeof(sample_record_t) == 16, "sample_record_t must be 16 bytes");
 
+/* Hlavička záznamu – uložena na stránce 0 flash po ukončení záznamu */
 typedef struct __attribute__((packed)) {
-    uint32_t magic;          // DATA_MAGIC
-    uint32_t version;        // DATA_VERSION
-    uint32_t sample_rate_hz;
-    uint32_t num_samples;
-    uint32_t accel_range;    // full scale in g
-    uint32_t gyro_range;     // full scale in dps
-    uint64_t epoch_ms_start; // epoch ms when recording started (0 if time not set)
-    uint8_t  reserved[256 - 32];
-} flash_header_t;            // 256 bytes = 1 page
+    uint32_t magic;          /* DATA_MAGIC ("KAPU" = 0x5550414B)             */
+    uint32_t version;        /* DATA_VERSION – formát dat                    */
+    uint32_t sample_rate_hz; /* Vzorkovací frekvence [Hz]                    */
+    uint32_t num_samples;    /* Celkový počet uložených vzorků               */
+    uint32_t accel_range;    /* Rozsah akcelerometru [g]                     */
+    uint32_t gyro_range;     /* Rozsah gyroskopu [°/s]                       */
+    uint64_t epoch_ms_start; /* Epoch čas začátku záznamu [ms] (0 = nenastaveno) */
+    uint8_t  reserved[256 - 32]; /* Rezerva do konce stránky                 */
+} flash_header_t;            /* Celkem: 256 bytů = 1 flash stránka           */
 
 _Static_assert(sizeof(flash_header_t) == 256, "flash_header_t must be 256 bytes");
 
-// --- State ---
+/* =======================================================================
+ *  Globální stav aplikace
+ * ======================================================================= */
 
-static volatile bool recording = false;
-static uint32_t num_samples = 0;
-static uint32_t flash_write_addr = 0;
+static volatile bool recording = false;    /* true = probíhá záznam (nastavuje ISR i USB) */
+static uint32_t num_samples = 0;           /* Počet dosud zaznamenaných vzorků              */
+static uint32_t flash_write_addr = 0;      /* Aktuální adresa pro zápis na flash            */
 
-// Epoch time offset: epoch_ms = ms_since_boot + epoch_offset_ms
-static int64_t epoch_offset_ms = 0;
-static bool time_is_set = false;
-static uint64_t record_epoch_ms_start = 0;
+/*
+ * Epoch čas – RP2040 nemá RTC s baterií, proto se čas nastavuje
+ * přes USB příkaz "settime <epoch_sec>". Interně se počítá offset
+ * vůči monotónnímu čítači (ms_since_boot).
+ *
+ *   epoch_ms = to_ms_since_boot() + epoch_offset_ms
+ */
+static int64_t epoch_offset_ms = 0;        /* Offset pro výpočet epoch času                */
+static bool time_is_set = false;           /* true pokud byl čas nastaven přes settime      */
+static uint64_t record_epoch_ms_start = 0; /* Epoch [ms] při startu záznamu                */
 
+/* Vrátí aktuální epoch čas v milisekundách */
 static uint64_t get_epoch_ms(void) {
     return (uint64_t)((int64_t)to_ms_since_boot(get_absolute_time()) + epoch_offset_ms);
 }
 
-// Page buffer for batching writes (256 bytes = 16 records)
+/* Stránkový buffer – akumuluje záznamy v RAM a zapisuje po 256 B najednou.
+ * Tím se minimalizuje počet SPI transakcí a sladí se s flash page write. */
 static uint8_t page_buf[FLASH_PAGE_SIZE];
 static uint16_t page_buf_pos = 0;
 
-// --- Flash page write helper ---
+/* =======================================================================
+ *  Pomocné funkce pro zápis na flash
+ * ======================================================================= */
 
+/* Zapíše aktuální stránkový buffer na flash. Zbylé místo doplní 0xFF.
+ * Pokud je adresa na hranici sektoru (4 KB), provede nejprve sector erase. */
 static void flush_page_buf(void) {
     if (page_buf_pos == 0) return;
 
@@ -71,6 +178,8 @@ static void flush_page_buf(void) {
     page_buf_pos = 0;
 }
 
+/* Přidá jeden záznam do stránkového bufferu.
+ * Po naplnění 16 záznamů (256 B) automaticky zapíše na flash. */
 static void write_record(const sample_record_t *rec) {
     memcpy(page_buf + page_buf_pos, rec, sizeof(sample_record_t));
     page_buf_pos += sizeof(sample_record_t);
@@ -80,8 +189,9 @@ static void write_record(const sample_record_t *rec) {
     }
 }
 
-// --- Write header to flash page 0 ---
-
+/* Zapíše hlavičku záznamu na stránku 0 flash.
+ * Volá se po ukončení záznamu – obsahuje finální počet vzorků
+ * a parametry nastavení. */
 static void write_header(void) {
     flash_header_t hdr;
     memset(&hdr, 0xFF, sizeof(hdr));
@@ -98,7 +208,12 @@ static void write_header(void) {
     w25q64_page_program(0, (const uint8_t *)&hdr, sizeof(hdr));
 }
 
-// --- USB serial command processing ---
+/* =======================================================================
+ *  Zpracování USB sériových příkazů
+ *
+ *  Příkazy se přijímají po řádcích (ukončené \r nebo \n).
+ *  Podporované příkazy: dump, erase, status, start, stop, settime
+ * ======================================================================= */
 
 static void process_command(const char *cmd) {
     if (strcmp(cmd, "dump") == 0) {
@@ -171,7 +286,7 @@ static void process_command(const char *cmd) {
         }
 
     } else if (strlen(cmd) > 7 && strncmp(cmd, "settime ", 7) == 0) {
-        // Parse epoch seconds from command
+        /* Parsování epoch sekund – jednoduchý ASCII → uint64 převod */
         uint64_t epoch_sec = 0;
         const char *p = cmd + 7;
         while (*p >= '0' && *p <= '9') {
@@ -191,45 +306,73 @@ static void process_command(const char *cmd) {
     }
 }
 
-// --- Button handling with debounce ---
+/* =======================================================================
+ *  Obsluha tlačítka s debouncingem (300 ms)
+ *
+ *  Tlačítko je na GP15, active low s interním pull-up.
+ *  Stisk přepíná stav záznamu (recording = !recording).
+ *  Vlastní start/stop logika je v hlavní smyčce (state machine).
+ * ======================================================================= */
 
 static uint32_t last_button_time = 0;
 
 static void button_callback(uint gpio, uint32_t events) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_button_time < 300) return; // debounce
+    if (now - last_button_time < 300) return;  /* Debounce – ignoruj opakované hrany */
     last_button_time = now;
 
     recording = !recording;
 }
 
-// --- LED states ---
+/* =======================================================================
+ *  LED indikace stavů – WS2812B RGB NeoPixel (onboard GP16)
+ *
+ *  Stav se nastavuje přes proměnnou led_mode, aktualizace barvy/blikání
+ *  probíhá voláním led_update() v hlavní smyčce.
+ *
+ *     LED_OFF          →  zhasnuto
+ *     LED_ON           →  zelená (ready)
+ *     LED_BLINK_SLOW   →  modrá, bliká 500 ms (záznam)
+ *     LED_BLINK_FAST   →  červená, bliká 100 ms (chyba MPU-6500)
+ *     LED_BLINK_FASTER →  žlutá, bliká 200 ms (chyba W25Q64)
+ * ======================================================================= */
 
 typedef enum {
-    LED_OFF,          // vypnuto
-    LED_ON,           // trvale svítí – ready
-    LED_BLINK_SLOW,   // pomalé blikání (500 ms) – záznam
-    LED_BLINK_FAST,   // rychlé blikání (100 ms) – chyba MPU
-    LED_BLINK_FASTER, // rychlejší blikání (200 ms) – chyba flash
+    LED_OFF,          /* Vypnuto                                          */
+    LED_ON,           /* Trvale zelená – připraveno ke startu             */
+    LED_BLINK_SLOW,   /* Modrá, bliká 500 ms – probíhá záznam            */
+    LED_BLINK_FAST,   /* Červená, bliká 100 ms – chyba inicializace MPU  */
+    LED_BLINK_FASTER, /* Žlutá, bliká 200 ms – chyba inicializace flash  */
 } led_mode_t;
 
-static led_mode_t led_mode = LED_OFF;
-static uint32_t led_last_toggle_ms = 0;
+static led_mode_t led_mode = LED_OFF;       /* Aktuální režim LED       */
+static uint32_t led_last_toggle_ms = 0;      /* Čas posledního přepnutí  */
+static bool led_blink_on = false;            /* Stav blikání (on/off)    */
 
-static void led_set(bool on) {
-    gpio_put(LED_PIN, on);
+/* Vrátí barvu (GRB uint32) odpovídající aktuálnímu LED režimu */
+static uint32_t led_mode_color(void) {
+    switch (led_mode) {
+        case LED_ON:           return ws2812_rgb(0, 40, 0);    // green
+        case LED_BLINK_SLOW:   return ws2812_rgb(0, 0, 40);    // blue
+        case LED_BLINK_FAST:   return ws2812_rgb(40, 0, 0);    // red
+        case LED_BLINK_FASTER: return ws2812_rgb(40, 30, 0);   // yellow
+        default:               return 0;
+    }
 }
 
+/* Aktualizuje stav LED – volat periodicky v hlavní smyčce.
+ * Pro režimy ON/OFF nastaví barvu přímo, pro blikání přepíná
+ * mezi barvou a zhasnutím podle zvoleného intervalu. */
 static void led_update(void) {
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     uint32_t interval = 0;
 
     switch (led_mode) {
         case LED_OFF:
-            led_set(false);
+            ws2812_put_pixel(0);
             return;
         case LED_ON:
-            led_set(true);
+            ws2812_put_pixel(led_mode_color());
             return;
         case LED_BLINK_SLOW:
             interval = 500;
@@ -244,19 +387,29 @@ static void led_update(void) {
 
     if (now_ms - led_last_toggle_ms >= interval) {
         led_last_toggle_ms = now_ms;
-        gpio_xor_mask(1u << LED_PIN);
+        led_blink_on = !led_blink_on;
+        ws2812_put_pixel(led_blink_on ? led_mode_color() : 0);
     }
 }
 
-// --- Main ---
+/* =======================================================================
+ *  Hlavní funkce – main()
+ *
+ *  1. Inicializace periferií (LED, tlačítko, padák, MPU-6500, W25Q64)
+ *  2. Čekání na USB připojení (2 s)
+ *  3. Nekonečná smyčka:
+ *     a) Příjem USB příkazů (neblokující čtení znaků)
+ *     b) State machine záznamu – start/stop přechody
+ *     c) Vzorkování IMU dat na 500 Hz s zápisem do flash
+ *     d) Aktualizace LED indikace
+ * ======================================================================= */
 
 int main(void) {
     stdio_init_all();
 
-    // LED
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    led_set(false);
+    // WS2812B RGB LED
+    ws2812_init(WS2812_PIN);
+    ws2812_off();
 
     // Button with pull-up
     gpio_init(BUTTON_PIN);
@@ -299,12 +452,20 @@ int main(void) {
         printf("WARNING: Time not set. Use 'settime <epoch_sec>' to set clock.\n");
     }
 
-    // --- Main loop ---
-    char cmd_buf[64];
-    uint8_t cmd_pos = 0;
-    bool was_recording = false;
-    uint64_t record_start_us = 0;
-    uint64_t next_sample_us = 0;
+    /* ===================================================================
+     *  Hlavní smyčka
+     *
+     *  Běží bez RTOS – kooperativní multitasking:
+     *  - USB čtení (neblokující getchar)
+     *  - State machine záznamu (recording → was_recording přechody)
+     *  - Vzorkování IMU s přesným 500 Hz timingem (time_us_64)
+     *  - LED blikání
+     * =================================================================== */
+    char cmd_buf[64];              /* Buffer pro USB příkaz (max 63 znaků)  */
+    uint8_t cmd_pos = 0;           /* Pozice v příkazovém bufferu           */
+    bool was_recording = false;    /* Předchozí stav – detekce přechodů    */
+    uint64_t record_start_us = 0;  /* Čas startu záznamu [µs]              */
+    uint64_t next_sample_us = 0;   /* Čas příštího vzorku [µs]             */
 
     while (1) {
         // --- Check USB serial for commands ---
@@ -388,7 +549,7 @@ int main(void) {
 
         }
 
-        // Aktualizace LED ve všech stavech
+        /* Aktualizace LED ve všech stavech (blikání / statická barva) */
         led_update();
     }
 

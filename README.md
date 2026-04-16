@@ -8,11 +8,11 @@ Cílem projektu je zaznamenávat letová data modelu rakety a v budoucnu detekov
 
 | Komponenta | Popis |
 |---|---|
-| MCU | RP2040 (Raspberry Pi Pico) |
+| MCU | RP2040 (Waveshare RP2040-Zero) |
 | IMU | MPU-6500 – 3-osý akcelerometr + gyroskop, SPI |
 | Flash | Winbond W25Q64FVSSIQ – 64 Mbit SPI flash |
 | Tlačítko | Start/stop záznamu (active low, interní pull-up) |
-| LED | Onboard LED – indikuje stav přístroje |
+| LED | WS2812B RGB NeoPixel (onboard) – barevná indikace stavu |
 
 ### Zapojení pinů
 
@@ -24,8 +24,8 @@ Cílem projektu je zaznamenávat letová data modelu rakety a v budoucnu detekov
 | Funkce | Pin |
 |---|---|
 | Tlačítko | GP15 |
-| LED | GP25 |
-| Padák (budoucí) | GP16 |
+| WS2812B RGB LED | GP16 (onboard) |
+| Padák (budoucí) | GP14 |
 
 ## Funkce
 
@@ -36,14 +36,14 @@ Cílem projektu je zaznamenávat letová data modelu rakety a v budoucnu detekov
 - Opětovný stisk tlačítka nebo příkaz `stop` zastaví záznam
 - Přes USB sériovou linku lze data stáhnout jako **CSV**
 
-### LED indikace
+### LED indikace (WS2812B RGB)
 
-| LED | Stav |
-|---|---|
-| Trvale svítí | Připraveno (ready) |
-| Bliká pomalu (500 ms) | Probíhá záznam |
-| Bliká rychle (100 ms) | Chyba MPU-6500 |
-| Bliká rychleji (200 ms) | Chyba W25Q64 flash |
+| Barva | Režim | Stav |
+|---|---|---|
+| 🟢 Zelená | Trvale svítí | Připraveno (ready) |
+| 🔵 Modrá | Bliká pomalu (500 ms) | Probíhá záznam |
+| 🔴 Červená | Bliká rychle (100 ms) | Chyba MPU-6500 |
+| 🟡 Žlutá | Bliká rychleji (200 ms) | Chyba W25Q64 flash |
 
 ### USB příkazy
 
@@ -176,7 +176,9 @@ kaputnik/
 │       ├── config.h             – definice pinů, parametry snímání
 │       ├── main.c               – hlavní logika (záznam, USB příkazy, LED)
 │       ├── mpu6500.h/c          – SPI driver pro MPU-6500
-│       └── w25q64.h/c           – SPI driver pro W25Q64 flash
+│       ├── w25q64.h/c           – SPI driver pro W25Q64 flash
+│       ├── ws2812.h/c           – PIO driver pro WS2812B RGB LED
+│       └── ws2812.pio           – PIO program pro WS2812B protokol
 ├── sw/                          ← PC aplikace (Rust)
 │   ├── Cargo.toml
 │   └── src/main.rs              – CLI downloader
@@ -188,7 +190,7 @@ kaputnik/
 
 - [ ] Detekce ztráty tahu raketového motoru
 - [ ] Detekce horní úvrati (apogee)
-- [ ] Automatické vypuštění padáku (GP16)
+- [ ] Automatické vypuštění padáku (GP14)
 - [ ] Kalibrace akcelerometru před startem
 - [ ] Vizualizace dat (grafy v PC aplikaci)
 

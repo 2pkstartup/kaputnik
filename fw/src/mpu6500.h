@@ -1,17 +1,33 @@
+/*
+ * mpu6500.h – SPI driver pro InvenSense MPU-6500 IMU
+ *
+ * MPU-6500 je 6-osý senzor pohybu (3-osý akcelerometr + 3-osý gyroskop)
+ * připojený přes SPI0. Driver provádí inicializaci, konfiguraci rozsahů
+ * a burst čtení všech os najednou (14 bytů = accel + temp + gyro).
+ *
+ * Výchozí nastavení pro Kaputnik:
+ *   - Akcelerometr: ±16g  (rozsah 3)
+ *   - Gyroskop:     ±2000°/s (rozsah 3)
+ *   - DLPF:         ~92 Hz bandwidth
+ *   - Sample rate:  500 Hz (divider = 1)
+ *   - WHO_AM_I:     0x70
+ */
+
 #ifndef MPU6500_H
 #define MPU6500_H
 
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Struktura pro surová data ze všech os MPU-6500 */
 typedef struct {
-    int16_t accel_x;
-    int16_t accel_y;
-    int16_t accel_z;
-    int16_t gyro_x;
-    int16_t gyro_y;
-    int16_t gyro_z;
-    int16_t temp_raw;
+    int16_t accel_x;    /* Raw akcelerometr osa X (LSB, ±16g → ±32768) */
+    int16_t accel_y;    /* Raw akcelerometr osa Y                       */
+    int16_t accel_z;    /* Raw akcelerometr osa Z                       */
+    int16_t gyro_x;     /* Raw gyroskop osa X (LSB, ±2000°/s → ±32768) */
+    int16_t gyro_y;     /* Raw gyroskop osa Y                           */
+    int16_t gyro_z;     /* Raw gyroskop osa Z                           */
+    int16_t temp_raw;   /* Raw teplota čipu (nepoužíváno při záznamu)   */
 } mpu6500_data_t;
 
 // Initialize MPU-6500 over SPI. Returns true on success.

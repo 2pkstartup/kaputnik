@@ -1,34 +1,61 @@
+/*
+ * mpu6500.c – SPI driver pro InvenSense MPU-6500 IMU
+ *
+ * Komunikace probíhá přes SPI0 (piny definované v config.h).
+ * SPI protokol MPU-6500:
+ *   - Zápis: bit 7 = 0, bity 6:0 = adresa registru
+ *   - Čtení: bit 7 = 1, bity 6:0 = adresa registru
+ *   - CS (chip select) active low, manuálně řízený přes GPIO
+ *
+ * Inicializační sekvence:
+ *   1. Reset (PWR_MGMT_1 = 0x80), čekání 100 ms
+ *   2. Clock source = auto-select (PWR_MGMT_1 = 0x01)
+ *   3. DLPF nastavení ~92 Hz pro accel i gyro
+ *   4. Sample rate divider = 1 → 1 kHz / 2 = 500 Hz
+ *   5. Accel ±16g, Gyro ±2000°/s
+ *   6. Všechny osy povoleny (PWR_MGMT_2 = 0x00)
+ */
+
 #include "mpu6500.h"
 #include "config.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
 
-// MPU-6500 Register addresses
-#define MPU_REG_SMPLRT_DIV      0x19
-#define MPU_REG_CONFIG          0x1A
-#define MPU_REG_GYRO_CONFIG     0x1B
-#define MPU_REG_ACCEL_CONFIG    0x1C
-#define MPU_REG_ACCEL_CONFIG2   0x1D
-#define MPU_REG_ACCEL_XOUT_H   0x3B
-#define MPU_REG_TEMP_OUT_H      0x41
-#define MPU_REG_GYRO_XOUT_H    0x43
-#define MPU_REG_PWR_MGMT_1     0x6B
-#define MPU_REG_PWR_MGMT_2     0x6C
-#define MPU_REG_WHO_AM_I       0x75
+/* -----------------------------------------------------------------------
+ *  Registry MPU-6500 (pouze používané)
+ * ----------------------------------------------------------------------- */
+#define MPU_REG_SMPLRT_DIV      0x19  /* Sample rate divider                */
+#define MPU_REG_CONFIG          0x1A  /* DLPF konfigurace (gyro)            */
+#define MPU_REG_GYRO_CONFIG     0x1B  /* Rozsah gyroskopu                   */
+#define MPU_REG_ACCEL_CONFIG    0x1C  /* Rozsah akcelerometru               */
+#define MPU_REG_ACCEL_CONFIG2   0x1D  /* DLPF konfigurace (accel)           */
+#define MPU_REG_ACCEL_XOUT_H   0x3B  /* Začátek bloku dat (14 bytů)        */
+#define MPU_REG_TEMP_OUT_H      0x41  /* Teplota (high byte)                */
+#define MPU_REG_GYRO_XOUT_H    0x43  /* Gyroskop X (high byte)             */
+#define MPU_REG_PWR_MGMT_1     0x6B  /* Power management 1                 */
+#define MPU_REG_PWR_MGMT_2     0x6C  /* Power management 2                 */
+#define MPU_REG_WHO_AM_I       0x75  /* Identifikace čipu (0x70)           */
 
-#define MPU_READ_FLAG  0x80
+#define MPU_READ_FLAG  0x80           /* Bit 7 = 1 pro čtení registru      */
 
+/* -----------------------------------------------------------------------
+ *  Nízkoúrovňové SPI helpery
+ * ----------------------------------------------------------------------- */
+
+/* Aktivace CS – stahuje CS pin na low */
 static inline void cs_select(void) {
     gpio_put(MPU_PIN_CS, 0);
     sleep_us(1);
 }
 
+/* Deaktivace CS – vrací CS pin na high */
 static inline void cs_deselect(void) {
     sleep_us(1);
     gpio_put(MPU_PIN_CS, 1);
 }
 
+/* Zápis jednoho bytu do registru */
 static void mpu_write_reg(uint8_t reg, uint8_t val) {
     uint8_t buf[2] = { reg & 0x7F, val };
     cs_select();
@@ -36,6 +63,7 @@ static void mpu_write_reg(uint8_t reg, uint8_t val) {
     cs_deselect();
 }
 
+/* Čtení jednoho bytu z registru */
 static uint8_t mpu_read_reg(uint8_t reg) {
     uint8_t tx = reg | MPU_READ_FLAG;
     uint8_t rx;
@@ -46,6 +74,7 @@ static uint8_t mpu_read_reg(uint8_t reg) {
     return rx;
 }
 
+/* Burst čtení více bytů ze sekvenčních registrů */
 static void mpu_read_regs(uint8_t reg, uint8_t *buf, uint16_t len) {
     uint8_t tx = reg | MPU_READ_FLAG;
     cs_select();
@@ -54,8 +83,12 @@ static void mpu_read_regs(uint8_t reg, uint8_t *buf, uint16_t len) {
     cs_deselect();
 }
 
+/* -----------------------------------------------------------------------
+ *  Veřejné API
+ * ----------------------------------------------------------------------- */
+
 bool mpu6500_init(void) {
-    // Init SPI pins
+    /* Inicializace SPI0 periferie a pinů */
     spi_init(MPU_SPI_PORT, MPU_SPI_FREQ);
     gpio_set_function(MPU_PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(MPU_PIN_MOSI, GPIO_FUNC_SPI);
@@ -68,34 +101,34 @@ bool mpu6500_init(void) {
 
     sleep_ms(100);
 
-    // Reset device
+    /* Reset čipu – všechny registry na výchozí hodnoty */
     mpu_write_reg(MPU_REG_PWR_MGMT_1, 0x80);
     sleep_ms(100);
 
-    // Wake up, use auto-select best clock
+    /* Probuzení, automatický výběr nejlepšího zdroje hodin */
     mpu_write_reg(MPU_REG_PWR_MGMT_1, 0x01);
     sleep_ms(10);
 
-    // Check WHO_AM_I
+    /* Ověření identity čipu (WHO_AM_I = 0x70 pro MPU-6500) */
     uint8_t id = mpu6500_who_am_i();
     if (id != 0x70) {
         return false;
     }
 
-    // DLPF config: bandwidth ~92 Hz for accel and gyro
+    /* DLPF: bandwidth ~92 Hz – filtrace šumu, vhodné pro 500 Hz sampling */
     mpu_write_reg(MPU_REG_CONFIG, 0x02);
     mpu_write_reg(MPU_REG_ACCEL_CONFIG2, 0x02);
 
-    // Set sample rate divider: 1kHz / (1+1) = 500 Hz
+    /* Sample rate = 1 kHz / (1 + divider) = 500 Hz */
     mpu_write_reg(MPU_REG_SMPLRT_DIV, 1);
 
-    // Set accel range ±16g
+    /* Rozsah akcelerometru: 3 = ±16g */
     mpu6500_set_accel_range(3);
 
-    // Set gyro range ±2000 °/s
+    /* Rozsah gyroskopu: 3 = ±2000 °/s */
     mpu6500_set_gyro_range(3);
 
-    // Enable all axes
+    /* Povoleni všech os akcelerometru i gyroskopu */
     mpu_write_reg(MPU_REG_PWR_MGMT_2, 0x00);
 
     return true;
@@ -107,8 +140,12 @@ uint8_t mpu6500_who_am_i(void) {
 
 void mpu6500_read_all(mpu6500_data_t *data) {
     uint8_t buf[14];
-    // Read 14 bytes starting from ACCEL_XOUT_H
-    // Layout: AXH AXL AYH AYL AZH AZL TH TL GXH GXL GYH GYL GZH GZL
+    /* Burst čtení 14 bytů od registru ACCEL_XOUT_H:
+     * [0..5]  = AXH AXL AYH AYL AZH AZL   (akcelerometr)
+     * [6..7]  = TH TL                        (teplota)
+     * [8..13] = GXH GXL GYH GYL GZH GZL    (gyroskop)
+     *
+     * Data jsou big-endian (MSB first). */
     mpu_read_regs(MPU_REG_ACCEL_XOUT_H, buf, 14);
 
     data->accel_x = (int16_t)((buf[0] << 8) | buf[1]);
