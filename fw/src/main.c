@@ -349,7 +349,9 @@ static void process_command(const char *cmd) {
     } else if (strcmp(cmd, "start") == 0) {
         if (!recording) {
             recording = true;
-            printf("Recording started via USB\n");
+            printf("START OK: recording requested\n");
+        } else {
+            printf("START OK: already recording\n");
         }
 
     } else if (strcmp(cmd, "stop") == 0) {
@@ -369,7 +371,7 @@ static void process_command(const char *cmd) {
         if (epoch_sec > 1000000000ULL) { // sanity: after 2001
             epoch_offset_ms = (int64_t)(epoch_sec * 1000ULL) - (int64_t)to_ms_since_boot(get_absolute_time());
             time_is_set = true;
-            printf("Time set. Epoch ms: %llu\n", get_epoch_ms());
+            printf("SYNC OK: epoch_ms=%llu\n", get_epoch_ms());
         } else {
             printf("ERROR: Invalid epoch (use seconds since 1970)\n");
         }
@@ -593,6 +595,10 @@ int main(void) {
             next_sample_us = record_start_us;
             was_recording = true;
             led_mode = LED_BLINK_SLOW;
+            led_last_toggle_ms = to_ms_since_boot(get_absolute_time());
+            led_blink_on = true;
+            ws2812_put_pixel(led_mode_color());
+            printf("LED: BLUE BLINK\n");
 
             /* Reset stavu letu a EMA filtru pro nový záznam */
             flight_state = FLIGHT_IDLE;
@@ -614,6 +620,7 @@ int main(void) {
             printf("Recording stopped. %u samples saved.\n", num_samples);
             printf("Use 'dump' to download data as CSV.\n");
             led_mode = LED_ON;
+            ws2812_put_pixel(led_mode_color());
         }
 
         // --- Sample data ---

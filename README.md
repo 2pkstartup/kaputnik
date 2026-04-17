@@ -54,7 +54,7 @@ Připojte se sériovým terminálem (115200 baud):
 
 | Příkaz | Akce |
 |---|---|
-| `start` | Spustí záznam |
+| `start` | Synchronizuje čas zařízení a spustí záznam |
 | `stop` | Zastaví záznam |
 | `dump` | Vypíše data jako CSV |
 | `erase` | Smaže celou flash |
@@ -284,11 +284,16 @@ kaputnik-downloader -p COM5 stop
 # Smazání flash
 kaputnik-downloader -p COM5 erase
 
-# Synchronizace hodin (nastaví čas zařízení na aktuální čas PC)
-kaputnik-downloader -p COM5 sync
+# `start` automaticky provede synchronizaci času + spuštění záznamu
+kaputnik-downloader -p COM5 start
 ```
 
 Když `-p` neuvedete, nástroj se pokusí port automaticky detekovat (USB zařízení podle metadata). Na Windows se obvykle používá `COMx`, na Linuxu `/dev/ttyACMx`.
+
+Po příkazu `start` aplikace očekává potvrzení ze zařízení ve stylu:
+- `SYNC OK: ...`
+- `START OK: ...`
+- `LED: BLUE BLINK`
 
 ### Windows quick start
 
@@ -303,10 +308,7 @@ cargo build --release
 # 3) Základní test komunikace
 .\target\release\kaputnik-downloader.exe status
 
-# 4) Synchronizace času zařízení (doporučeno před letem)
-.\target\release\kaputnik-downloader.exe sync
-
-# 5) Ruční volba portu, pokud je potřeba
+# 4) Ruční volba portu, pokud je potřeba
 .\target\release\kaputnik-downloader.exe -p COM5 status
 ```
 
@@ -315,18 +317,16 @@ Poznámka: na Windows může být potřeba po připojení zařízení pár sekun
 ### Typický workflow před letem
 
 ```bash
-# 1. Synchronizace hodin
-kaputnik-downloader sync
-
-# 2. Spuštění záznamu (nebo tlačítkem na desce)
+# 1. Spuštění záznamu (nebo tlačítkem na desce)
+#    (`start` nejdřív nastaví čas zařízení)
 kaputnik-downloader start
 
-# 3. ...let...
+# 2. ...let...
 
-# 4. Zastavení záznamu (nebo tlačítkem)
+# 3. Zastavení záznamu (nebo tlačítkem)
 kaputnik-downloader stop
 
-# 5. Stažení dat
+# 4. Stažení dat
 kaputnik-downloader dump -o flight.csv
 ```
 

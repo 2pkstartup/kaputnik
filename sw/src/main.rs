@@ -8,9 +8,8 @@
 //!    dump   – stažení letových dat jako CSV (s progress barem)
 //!    status – zobrazení stavu zařízení (MPU, flash, čas, záznam)
 //!    erase  – smazání celé flash paměti
-//!    start  – spuštění záznamu vzdáleně
+//!    start  – synchronizace času + spuštění záznamu vzdáleně
 //!    stop   – zastavení záznamu vzdáleně
-//!    sync   – synchronizace hodin (nastaví epoch čas na zařízení)
 //!    list   – výpis dostupných sériových portů
 //!
 //!  Výchozí port: auto-detekce USB/serial portu, 115200 baud
@@ -60,8 +59,6 @@ enum Commands {
     Start,
     /// Zastavit záznam
     Stop,
-    /// Synchronizovat hodiny zařízení s PC
-    Sync,
     /// Vypsat dostupné sériové porty
     List,
 }
@@ -324,28 +321,66 @@ fn cmd_simple(port_name: &str, baud: u32, cmd: &str) -> Result<()> {
 }
 
 // =========================================================================
-//  Příkaz: sync – synchronizace hodin
+//  Příkaz: start – automatická synchronizace času + start záznamu
 //
-//  Získá aktuální epoch sekundy z PC a pošle "settime <epoch>" na zařízení.
-//  RP2040 nemá RTC s baterií, takže čas se musí nastavit před každým letem.
+//  1) Získá aktuální epoch sekundy z PC a pošle "settime <epoch>"
+//  2) Po potvrzení pošle "start"
+//
+//  RP2040 nemá RTC s baterií, takže synchronizace před startem
+//  zabraňuje zapomenutí ručního kroku.
 // =========================================================================
 
-fn cmd_sync(port_name: &str, baud: u32) -> Result<()> {
+fn cmd_start(port_name: &str, baud: u32) -> Result<()> {
     let epoch_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System clock error")?
         .as_secs();
 
-    let cmd = format!("settime {epoch_secs}");
+    let settime_cmd = format!("settime {epoch_secs}");
     eprintln!("Setting device clock to epoch {epoch_secs}...");
 
     let mut port = open_port(port_name, baud)?;
-    send_command(&mut port, &cmd)?;
 
-    let lines = read_lines(&mut port)?;
-    for line in &lines {
+    send_command(&mut port, &settime_cmd)?;
+    let sync_lines = read_lines(&mut port)?;
+    for line in &sync_lines {
         println!("{line}");
     }
+
+    let sync_ok = sync_lines
+        .iter()
+        .any(|line| line.starts_with("SYNC OK") || line.starts_with("Time set."));
+    if !sync_ok {
+        bail!("Device did not confirm time sync");
+    }
+    eprintln!("Time sync confirmed.");
+
+    eprintln!("Starting recording...");
+    send_command(&mut port, "start")?;
+
+    let start_lines = read_lines(&mut port)?;
+    for line in &start_lines {
+        println!("{line}");
+    }
+
+    let start_ok = start_lines.iter().any(|line| {
+        line.starts_with("START OK")
+            || line.contains("Recording started")
+            || line.contains("already recording")
+    });
+    if !start_ok {
+        bail!("Device did not confirm recording start");
+    }
+
+    let led_ok = start_lines
+        .iter()
+        .any(|line| line.contains("LED: BLUE BLINK"));
+    if led_ok {
+        eprintln!("Start confirmed. LED switched to blue blink.");
+    } else {
+        eprintln!("Start confirmed.");
+    }
+
     Ok(())
 }
 
@@ -402,9 +437,8 @@ fn main() -> Result<()> {
             eprintln!("Erasing flash... this may take a while.");
             cmd_simple(&port_name, cli.baud, "erase")
         }
-        Commands::Start => cmd_simple(&port_name, cli.baud, "start"),
+        Commands::Start => cmd_start(&port_name, cli.baud),
         Commands::Stop => cmd_simple(&port_name, cli.baud, "stop"),
-        Commands::Sync => cmd_sync(&port_name, cli.baud),
         Commands::List => unreachable!(),
     }
 }
