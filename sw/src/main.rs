@@ -13,12 +13,13 @@
 //!    sync   – synchronizace hodin (nastaví epoch čas na zařízení)
 //!    list   – výpis dostupných sériových portů
 //!
-//!  Výchozí port: /dev/ttyACM0, 115200 baud
-//!  Změna: kaputnik-downloader -p /dev/ttyACM1 status
+//!  Výchozí port: auto-detekce USB/serial portu, 115200 baud
+//!  Ruční volba: kaputnik-downloader -p COM5 status
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use serialport::UsbPortInfo;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,9 +32,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[command(name = "kaputnik-downloader")]
 #[command(about = "Kaputnik flight data downloader")]
 struct Cli {
-    /// Sériový port (např. /dev/ttyACM0)
-    #[arg(short, long, default_value = "/dev/ttyACM0")]
-    port: String,
+    /// Sériový port (např. COM5, /dev/ttyACM0). Když není uveden, zkusí se auto-detekce USB zařízení.
+    #[arg(short, long)]
+    port: Option<String>,
 
     /// Přenosová rychlost [baud]
     #[arg(short, long, default_value_t = 115200)]
@@ -76,6 +77,78 @@ fn open_port(port: &str, baud: u32) -> Result<Box<dyn serialport::SerialPort>> {
         .timeout(Duration::from_secs(5))
         .open()
         .with_context(|| format!("Cannot open serial port {port}"))
+}
+
+/// Vrátí true, pokud metadata USB portu vypadají jako Kaputnik/RP2040 CDC zařízení.
+fn is_likely_kaputnik_usb(usb: &UsbPortInfo) -> bool {
+    let product = usb.product.as_deref().unwrap_or_default().to_lowercase();
+    let manufacturer = usb
+        .manufacturer
+        .as_deref()
+        .unwrap_or_default()
+        .to_lowercase();
+
+    [
+        "kaputnik",
+        "rp2040",
+        "raspberry",
+        "pico",
+        "cdc",
+        "usb serial",
+    ]
+    .iter()
+    .any(|keyword| product.contains(keyword) || manufacturer.contains(keyword))
+}
+
+/// Auto-detekuje nejvhodnější sériový port.
+///
+/// Priorita:
+/// 1) USB port, který metadata odpovídá Kaputnik/RP2040
+/// 2) libovolný USB port
+/// 3) fallback podle názvu portu na platformě (COMx na Windows, ttyACM/ttyUSB na Linuxu)
+/// 4) první dostupný port
+fn detect_auto_port() -> Result<String> {
+    let ports = serialport::available_ports().context("Cannot list serial ports")?;
+
+    if ports.is_empty() {
+        bail!("No serial ports found. Connect the device and try again.");
+    }
+
+    if let Some(port) = ports.iter().find(|p| {
+        matches!(&p.port_type, serialport::SerialPortType::UsbPort(usb) if is_likely_kaputnik_usb(usb))
+    }) {
+        return Ok(port.port_name.clone());
+    }
+
+    if let Some(port) = ports.iter().find(|p| {
+        matches!(&p.port_type, serialport::SerialPortType::UsbPort(_))
+    }) {
+        return Ok(port.port_name.clone());
+    }
+
+    if cfg!(windows) {
+        if let Some(port) = ports.iter().find(|p| p.port_name.to_uppercase().starts_with("COM")) {
+            return Ok(port.port_name.clone());
+        }
+    } else if let Some(port) = ports
+        .iter()
+        .find(|p| p.port_name.contains("ttyACM") || p.port_name.contains("ttyUSB"))
+    {
+        return Ok(port.port_name.clone());
+    }
+
+    Ok(ports[0].port_name.clone())
+}
+
+/// Vrátí explicitně zadaný port, nebo auto-detekovaný port.
+fn resolve_port_name(cli_port: Option<&str>) -> Result<String> {
+    if let Some(port) = cli_port {
+        return Ok(port.to_string());
+    }
+
+    let detected = detect_auto_port()?;
+    eprintln!("Auto-detected serial port: {detected}");
+    Ok(detected)
 }
 
 /// Odešle textový příkaz na zařízení (ukončený \r\n).
@@ -280,7 +353,7 @@ fn cmd_sync(port_name: &str, baud: u32) -> Result<()> {
 //  Příkaz: list – výpis sériových portů
 //
 //  Vypíše všechny dostupné porty s typem (USB/PCI/Bluetooth).
-//  Užitečné pro nalezení správného /dev/ttyACMx.
+//  Užitečné pro nalezení správného COMx nebo /dev/ttyACMx.
 // =========================================================================
 
 fn cmd_list() -> Result<()> {
@@ -291,9 +364,12 @@ fn cmd_list() -> Result<()> {
         for p in &ports {
             let info = match &p.port_type {
                 serialport::SerialPortType::UsbPort(usb) => {
+                    let mfg = usb.manufacturer.as_deref().unwrap_or("unknown");
+                    let product = usb.product.as_deref().unwrap_or("unknown");
+                    let serial = usb.serial_number.as_deref().unwrap_or("n/a");
                     format!(
-                        "USB - {}",
-                        usb.product.as_deref().unwrap_or("unknown")
+                        "USB - {} / {} | VID:PID {:04x}:{:04x} | SN: {}",
+                        mfg, product, usb.vid, usb.pid, serial
                     )
                 }
                 serialport::SerialPortType::PciPort => "PCI".to_string(),
@@ -313,16 +389,22 @@ fn cmd_list() -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if matches!(cli.command, Commands::List) {
+        return cmd_list();
+    }
+
+    let port_name = resolve_port_name(cli.port.as_deref())?;
+
     match cli.command {
-        Commands::Dump { output } => cmd_dump(&cli.port, cli.baud, output),
-        Commands::Status => cmd_simple(&cli.port, cli.baud, "status"),
+        Commands::Dump { output } => cmd_dump(&port_name, cli.baud, output),
+        Commands::Status => cmd_simple(&port_name, cli.baud, "status"),
         Commands::Erase => {
             eprintln!("Erasing flash... this may take a while.");
-            cmd_simple(&cli.port, cli.baud, "erase")
+            cmd_simple(&port_name, cli.baud, "erase")
         }
-        Commands::Start => cmd_simple(&cli.port, cli.baud, "start"),
-        Commands::Stop => cmd_simple(&cli.port, cli.baud, "stop"),
-        Commands::Sync => cmd_sync(&cli.port, cli.baud),
-        Commands::List => cmd_list(),
+        Commands::Start => cmd_simple(&port_name, cli.baud, "start"),
+        Commands::Stop => cmd_simple(&port_name, cli.baud, "stop"),
+        Commands::Sync => cmd_sync(&port_name, cli.baud),
+        Commands::List => unreachable!(),
     }
 }

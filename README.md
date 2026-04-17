@@ -265,27 +265,52 @@ Rust CLI nástroj pro komunikaci s Kaputnikem přes USB sériovou linku.
 # Výpis dostupných sériových portů
 kaputnik-downloader list
 
+# Stav zařízení (auto-detekce portu)
+kaputnik-downloader status
+
 # Stav zařízení
-kaputnik-downloader -p /dev/ttyACM0 status
+kaputnik-downloader -p COM5 status
 
 # Stáhnutí dat do CSV souboru
-kaputnik-downloader -p /dev/ttyACM0 dump -o flight.csv
+kaputnik-downloader -p COM5 dump -o flight.csv
 
 # Stáhnutí dat na stdout
-kaputnik-downloader -p /dev/ttyACM0 dump
+kaputnik-downloader -p COM5 dump
 
 # Spuštění / zastavení záznamu
-kaputnik-downloader -p /dev/ttyACM0 start
-kaputnik-downloader -p /dev/ttyACM0 stop
+kaputnik-downloader -p COM5 start
+kaputnik-downloader -p COM5 stop
 
 # Smazání flash
-kaputnik-downloader -p /dev/ttyACM0 erase
+kaputnik-downloader -p COM5 erase
 
 # Synchronizace hodin (nastaví čas zařízení na aktuální čas PC)
-kaputnik-downloader -p /dev/ttyACM0 sync
+kaputnik-downloader -p COM5 sync
 ```
 
-Výchozí port je `/dev/ttyACM0`, lze změnit přepínačem `-p`.
+Když `-p` neuvedete, nástroj se pokusí port automaticky detekovat (USB zařízení podle metadata). Na Windows se obvykle používá `COMx`, na Linuxu `/dev/ttyACMx`.
+
+### Windows quick start
+
+```powershell
+# 1) Build aplikace
+cd sw
+cargo build --release
+
+# 2) Výpis portů (najdi COMx)
+.\target\release\kaputnik-downloader.exe list
+
+# 3) Základní test komunikace
+.\target\release\kaputnik-downloader.exe status
+
+# 4) Synchronizace času zařízení (doporučeno před letem)
+.\target\release\kaputnik-downloader.exe sync
+
+# 5) Ruční volba portu, pokud je potřeba
+.\target\release\kaputnik-downloader.exe -p COM5 status
+```
+
+Poznámka: na Windows může být potřeba po připojení zařízení pár sekund počkat, než se COM port objeví v systému.
 
 ### Typický workflow před letem
 
