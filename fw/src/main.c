@@ -43,12 +43,13 @@
  * --------------------------------------------------------------------------
  *
  *  Stránka 0 (256 B):  flash_header_t – magic, verze, počet vzorků, epoch
- *  Stránky 1+:         sample_record_t – 16 B na záznam, 16 záznamů/stránka
+ *  Stránky 1+:         sample_record_t – 17 B na záznam
  *
- *  Jeden záznam (16 B, packed):
+ *  Jeden záznam (17 B, packed):
  *      uint32_t timestamp_us   – čas od začátku záznamu [µs]
  *      int16_t  ax, ay, az     – raw akcelerometr (±16g → ±32768)
  *      int16_t  gx, gy, gz     – raw gyroskop (±2000°/s → ±32768)
+ *      uint8_t  gp14_state     – stav padákového výstupu GP14 (0/1)
  *
  *  Kapacita: ~500 000 vzorků ≈ 16 minut při 500 Hz
  *
@@ -58,7 +59,7 @@
  *
  *      start              – spustit záznam
  *      stop               – zastavit záznam
- *      dump               – vypsat data jako CSV (epoch_ms,ax,ay,az,gx,gy,gz)
+ *      dump               – vypsat data jako CSV (epoch_ms,ax,ay,az,gx,gy,gz,gp14)
  *      erase              – smazat celou flash
  *      status             – stav zařízení (MPU, flash, čas, záznam)
  *      settime <epoch_s>  – nastavit vnitřní hodiny (epoch sekundy od 1970)
@@ -111,21 +112,22 @@
  *
  *  Flash layout:
  *    Adresa 0x000000 .. 0x0000FF  →  flash_header_t (1 stránka = 256 B)
- *    Adresa 0x000100 .. 0x7FFFFF  →  sample_record_t (16 B × N)
+ *    Adresa 0x000100 .. 0x7FFFFF  →  sample_record_t (17 B × N)
  *
- *  Každá stránka (256 B) pojme přesně 16 záznamů.
+ *  Každá stránka (256 B) pojme floor(256/17)=15 záznamů.
  *  Zápis probíhá stránkově – záznamy se bufferují v RAM a zapisují
  *  najednou po naplnění 256B bufferu.
  * ======================================================================= */
 
-/* Jeden vzorek letových dat – 16 bytů, packed pro přesné zarovnání na flash */
+/* Jeden vzorek letových dat – 17 bytů, packed pro přesné zarovnání na flash */
 typedef struct __attribute__((packed)) {
     uint32_t timestamp_us;  /* Čas od začátku záznamu [µs]                   */
     int16_t  ax, ay, az;    /* Raw akcelerometr (LSB, ±16g → ±32768)         */
     int16_t  gx, gy, gz;    /* Raw gyroskop     (LSB, ±2000°/s → ±32768)     */
-} sample_record_t;          /* Celkem: 4 + 6×2 = 16 bytů                     */
+    uint8_t  gp14_state;    /* Stav GPIO GP14 (padákový výstup): 0/1         */
+} sample_record_t;          /* Celkem: 4 + 6×2 + 1 = 17 bytů                 */
 
-_Static_assert(sizeof(sample_record_t) == 16, "sample_record_t must be 16 bytes");
+_Static_assert(sizeof(sample_record_t) == 17, "sample_record_t must be 17 bytes");
 
 /* Hlavička záznamu – uložena na stránce 0 flash po ukončení záznamu */
 typedef struct __attribute__((packed)) {
@@ -288,6 +290,14 @@ static void write_header(void) {
  *  Podporované příkazy: dump, erase, status, start, stop, settime
  * ======================================================================= */
 
+typedef struct __attribute__((packed)) {
+    uint32_t timestamp_us;
+    int16_t  ax, ay, az;
+    int16_t  gx, gy, gz;
+} sample_record_v2_t;
+
+_Static_assert(sizeof(sample_record_v2_t) == 16, "sample_record_v2_t must be 16 bytes");
+
 static void process_command(const char *cmd) {
     if (strcmp(cmd, "dump") == 0) {
         // Read header
@@ -305,18 +315,33 @@ static void process_command(const char *cmd) {
         printf("# Accel range: +/-%u g\n", hdr.accel_range);
         printf("# Gyro range: +/-%u dps\n", hdr.gyro_range);
         printf("# Epoch start: %llu\n", hdr.epoch_ms_start);
-        printf("epoch_ms,ax,ay,az,gx,gy,gz\n");
+        printf("epoch_ms,ax,ay,az,gx,gy,gz,gp14\n");
 
         uint32_t addr = FLASH_DATA_START;
-        sample_record_t rec;
-        for (uint32_t i = 0; i < hdr.num_samples; i++) {
-            w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
-            uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
-            printf("%llu,%d,%d,%d,%d,%d,%d\n",
-                   epoch_ms,
-                   rec.ax, rec.ay, rec.az,
-                   rec.gx, rec.gy, rec.gz);
-            addr += sizeof(rec);
+        if (hdr.version >= 3) {
+            sample_record_t rec;
+            for (uint32_t i = 0; i < hdr.num_samples; i++) {
+                w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
+                uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
+                printf("%llu,%d,%d,%d,%d,%d,%d,%u\n",
+                       epoch_ms,
+                       rec.ax, rec.ay, rec.az,
+                       rec.gx, rec.gy, rec.gz,
+                       rec.gp14_state);
+                addr += sizeof(rec);
+            }
+        } else {
+            sample_record_v2_t rec;
+            for (uint32_t i = 0; i < hdr.num_samples; i++) {
+                w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
+                uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
+                printf("%llu,%d,%d,%d,%d,%d,%d,%u\n",
+                       epoch_ms,
+                       rec.ax, rec.ay, rec.az,
+                       rec.gx, rec.gy, rec.gz,
+                       0u);
+                addr += sizeof(rec);
+            }
         }
         printf("# END\n");
 
@@ -715,6 +740,7 @@ int main(void) {
                 rec.gx = mpu_data.gyro_x;
                 rec.gy = mpu_data.gyro_y;
                 rec.gz = mpu_data.gyro_z;
+                rec.gp14_state = (uint8_t)gpio_get(PARACHUTE_PIN);
 
                 write_record(&rec);
                 num_samples++;

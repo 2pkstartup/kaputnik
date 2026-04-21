@@ -30,7 +30,7 @@ Cílem projektu je zaznamenávat letová data modelu rakety, detekovat horní ú
 ## Funkce
 
 - Po stisku tlačítka (nebo USB příkazu `start`) se spustí záznam dat z MPU-6500 na **500 Hz**
-- Každý vzorek (16 bytů): timestamp (µs), 3× akcelerometr, 3× gyroskop (raw int16)
+- Každý vzorek (17 bytů): timestamp (µs), 3× akcelerometr, 3× gyroskop (raw int16), stav GP14
 - Data se zapisují na externí W25Q64 flash (stránkovaný zápis po 256 B)
 - Kapacita: cca **500 000 vzorků** (~16 minut záznamu)
 - Opětovný stisk tlačítka nebo příkaz `stop` zastaví záznam
@@ -64,20 +64,20 @@ Připojte se sériovým terminálem (115200 baud):
 ### CSV formát výstupu
 
 ```
-# KAPUTNIK Flight Data v2
+# KAPUTNIK Flight Data v3
 # Sample rate: 500 Hz
 # Samples: 12345
 # Accel range: +/-16 g
 # Gyro range: +/-2000 dps
 # Epoch start: 1776556800000
-epoch_ms,ax,ay,az,gx,gy,gz
-1776556800000,123,-456,16384,10,-5,2
-1776556800002,125,-460,16380,12,-3,1
+epoch_ms,ax,ay,az,gx,gy,gz,gp14
+1776556800000,123,-456,16384,10,-5,2,0
+1776556800002,125,-460,16380,12,-3,1,0
 ...
 # END
 ```
 
-Každý záznam obsahuje absolutní časový otisk `epoch_ms` (milisekundy od 1.1.1970). Vyžaduje synchronizaci hodin před záznamem.
+Každý záznam obsahuje absolutní časový otisk `epoch_ms` (milisekundy od 1.1.1970) a stav výstupu `gp14` (0/1). Vyžaduje synchronizaci hodin před záznamem.
 
 ## EMA filtr – vyhlazování dat pro detekci apogea
 

@@ -102,6 +102,6 @@
  *  Identifikace datového formátu
  * ----------------------------------------------------------------------- */
 #define DATA_MAGIC  0x5550414B  /* ASCII "KAPU" (little-endian)              */
-#define DATA_VERSION 2          /* Verze formátu (v2 = s epoch_ms_start)     */
+#define DATA_VERSION 3          /* Verze formátu (v3 = + gp14 stav ve vzorku) */
 
 #endif /* CONFIG_H */
