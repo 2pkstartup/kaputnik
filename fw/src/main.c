@@ -260,10 +260,15 @@ static void flush_page_buf(void) {
 /* Přidá jeden záznam do stránkového bufferu.
  * Po zaplnění 256B stránky automaticky zapíše na flash. */
 static void write_record(const sample_record_t *rec) {
+    /* Pokud by záznam přesáhl stránku, zapíše nejprve aktuální buffer */
+    if (page_buf_pos + sizeof(sample_record_t) > FLASH_PAGE_SIZE) {
+        flush_page_buf();
+    }
+
     memcpy(page_buf + page_buf_pos, rec, sizeof(sample_record_t));
     page_buf_pos += sizeof(sample_record_t);
 
-    if (page_buf_pos >= FLASH_PAGE_SIZE) {
+    if (page_buf_pos == FLASH_PAGE_SIZE) {
         flush_page_buf();
     }
 }
@@ -328,16 +333,17 @@ static void process_command(const char *cmd) {
         printf("# Accel range: +/-%u g\n", hdr.accel_range);
         printf("# Gyro range: +/-%u dps\n", hdr.gyro_range);
         printf("# Epoch start: %llu\n", hdr.epoch_ms_start);
-        printf("epoch_ms,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid\n");
+        printf("epoch_us,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid\n");
 
         uint32_t addr = FLASH_DATA_START;
-        if (hdr.version >= 4) {
+        if (hdr.version >= 5) {
+            /* v5+: data začínají na sektoru 1 (FLASH_DATA_START = 0x1000) */
             sample_record_t rec;
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
                 w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
-                uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
+                uint64_t epoch_us = hdr.epoch_ms_start * 1000ULL + rec.timestamp_us;
                 printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
-                       epoch_ms,
+                       epoch_us,
                        rec.ax, rec.ay, rec.az,
                        rec.gx, rec.gy, rec.gz,
                        rec.gp14_state,
@@ -345,13 +351,29 @@ static void process_command(const char *cmd) {
                        rec.mag_valid);
                 addr += sizeof(rec);
             }
+        } else if (hdr.version >= 4) {
+            /* v4: data začínají na stránce 1 (adresa 0x100) */
+            uint32_t addr_v4 = FLASH_PAGE_SIZE;
+            sample_record_t rec;
+            for (uint32_t i = 0; i < hdr.num_samples; i++) {
+                w25q64_read(addr_v4, (uint8_t *)&rec, sizeof(rec));
+                uint64_t epoch_us = hdr.epoch_ms_start * 1000ULL + rec.timestamp_us;
+                printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
+                       epoch_us,
+                       rec.ax, rec.ay, rec.az,
+                       rec.gx, rec.gy, rec.gz,
+                       rec.gp14_state,
+                       rec.mx, rec.my, rec.mz,
+                       rec.mag_valid);
+                addr_v4 += sizeof(rec);
+            }
         } else if (hdr.version >= 3) {
             sample_record_v3_t rec;
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
                 w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
-                uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
+                uint64_t epoch_us = hdr.epoch_ms_start * 1000ULL + rec.timestamp_us;
                 printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
-                       epoch_ms,
+                       epoch_us,
                        rec.ax, rec.ay, rec.az,
                        rec.gx, rec.gy, rec.gz,
                        rec.gp14_state,
@@ -363,9 +385,9 @@ static void process_command(const char *cmd) {
             sample_record_v2_t rec;
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
                 w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
-                uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
+                uint64_t epoch_us = hdr.epoch_ms_start * 1000ULL + rec.timestamp_us;
                 printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
-                       epoch_ms,
+                       epoch_us,
                        rec.ax, rec.ay, rec.az,
                        rec.gx, rec.gy, rec.gz,
                        0u,
@@ -426,10 +448,10 @@ static void process_command(const char *cmd) {
             printf("Recording stopped via USB\n");
         }
 
-    } else if (strlen(cmd) > 7 && strncmp(cmd, "settime ", 7) == 0) {
+    } else if (strlen(cmd) > 8 && strncmp(cmd, "settime ", 8) == 0) {
         /* Parsování epoch sekund – jednoduchý ASCII → uint64 převod */
         uint64_t epoch_sec = 0;
-        const char *p = cmd + 7;
+        const char *p = cmd + 8;
         while (*p >= '0' && *p <= '9') {
             epoch_sec = epoch_sec * 10 + (*p - '0');
             p++;
@@ -472,6 +494,7 @@ static void button_callback(uint gpio, uint32_t events) {
  *  probíhá voláním led_update() v hlavní smyčce.
  *
  *     LED_OFF          →  zhasnuto
+ *     LED_BOOT         →  oranžová (napájení připojeno / boot)
  *     LED_ON           →  zelená (ready)
  *     LED_BLINK_SLOW   →  modrá, bliká 500 ms (záznam)
  *     LED_BLINK_FAST   →  červená, bliká 100 ms (chyba MPU-6500)
@@ -480,6 +503,7 @@ static void button_callback(uint gpio, uint32_t events) {
 
 typedef enum {
     LED_OFF,          /* Vypnuto                                          */
+     LED_BOOT,         /* Trvale oranžová – napájení/boot                 */
     LED_ON,           /* Trvale zelená – připraveno ke startu             */
     LED_BLINK_SLOW,   /* Modrá, bliká 500 ms – probíhá záznam            */
     LED_BLINK_FAST,   /* Červená, bliká 100 ms – chyba inicializace IMU  */
@@ -494,12 +518,42 @@ static bool led_blink_on = false;            /* Stav blikání (on/off)    */
 /* Vrátí barvu (GRB uint32) odpovídající aktuálnímu LED režimu */
 static uint32_t led_mode_color(void) {
     switch (led_mode) {
+        case LED_BOOT:         return ws2812_rgb(40, 14, 0);   // orange
         case LED_ON:           return ws2812_rgb(0, 40, 0);    // green
         case LED_BLINK_SLOW:   return ws2812_rgb(0, 0, 40);    // blue
         case LED_BLINK_FAST:   return ws2812_rgb(40, 0, 0);    // red
         case LED_BLINK_FASTER: return ws2812_rgb(40, 30, 0);   // yellow
         case LED_BLINK_APOGEE: return ws2812_rgb(40, 0, 40);   // purple
         default:               return 0;
+    }
+}
+
+/* Nastaví režim LED a okamžitě promítne změnu do WS2812, aby byl stav
+ * viditelný i mimo hlavní periodické volání led_update(). */
+static void led_set_mode(led_mode_t mode) {
+    led_mode = mode;
+    led_last_toggle_ms = to_ms_since_boot(get_absolute_time());
+
+    switch (led_mode) {
+        case LED_OFF:
+            led_blink_on = false;
+            ws2812_put_pixel(0);
+            break;
+        case LED_BOOT:
+            led_blink_on = true;
+            ws2812_put_pixel(led_mode_color());
+            break;
+        case LED_ON:
+            led_blink_on = true;
+            ws2812_put_pixel(led_mode_color());
+            break;
+        case LED_BLINK_SLOW:
+        case LED_BLINK_FAST:
+        case LED_BLINK_FASTER:
+        case LED_BLINK_APOGEE:
+            led_blink_on = true;
+            ws2812_put_pixel(led_mode_color());
+            break;
     }
 }
 
@@ -513,6 +567,9 @@ static void led_update(void) {
     switch (led_mode) {
         case LED_OFF:
             ws2812_put_pixel(0);
+            return;
+        case LED_BOOT:
+            ws2812_put_pixel(led_mode_color());
             return;
         case LED_ON:
             ws2812_put_pixel(led_mode_color());
@@ -555,7 +612,7 @@ int main(void) {
 
     // WS2812B RGB LED
     ws2812_init(WS2812_PIN);
-    ws2812_off();
+    led_set_mode(LED_BOOT);
 
     // Button with pull-up
     gpio_init(BUTTON_PIN);
@@ -576,7 +633,7 @@ int main(void) {
     // Init IMU (GY-9250 / MPU-6500 / MPU-9250)
     if (!imu_init()) {
         printf("ERROR: IMU init failed (WHO_AM_I: 0x%02X)\n", imu_who_am_i());
-        led_mode = LED_BLINK_FAST;
+        led_set_mode(LED_BLINK_FAST);
         while (1) { led_update(); }
     }
     printf("IMU OK (WHO_AM_I: 0x%02X)\n", imu_who_am_i());
@@ -589,13 +646,13 @@ int main(void) {
     // Init W25Q64
     if (!w25q64_init()) {
         printf("ERROR: W25Q64 init failed (JEDEC: 0x%06X)\n", w25q64_read_jedec_id());
-        led_mode = LED_BLINK_FASTER;
+        led_set_mode(LED_BLINK_FASTER);
         while (1) { led_update(); }
     }
     printf("W25Q64 OK (JEDEC: 0x%06X)\n", w25q64_read_jedec_id());
 
     // Ready – LED trvale svítí
-    led_mode = LED_ON;
+    led_set_mode(LED_ON);
 
     printf("Ready. Press button or type 'start' to begin recording.\n");
     printf("Commands: dump, erase, status, start, stop, settime <epoch_sec>\n");
@@ -653,10 +710,7 @@ int main(void) {
         // --- Recording state transitions ---
         if (recording && !was_recording) {
             // Start recording
-            printf("Recording started! Erasing flash...\n");
-
-            // Erase first 4KB sector for header
-            w25q64_sector_erase(0);
+            printf("Recording started!\n");
 
             num_samples = 0;
             flash_write_addr = FLASH_DATA_START;
@@ -665,10 +719,7 @@ int main(void) {
             record_start_us = time_us_64();
             next_sample_us = record_start_us;
             was_recording = true;
-            led_mode = LED_BLINK_SLOW;
-            led_last_toggle_ms = to_ms_since_boot(get_absolute_time());
-            led_blink_on = true;
-            ws2812_put_pixel(led_mode_color());
+            led_set_mode(LED_BLINK_SLOW);
             printf("LED: BLUE BLINK\n");
 
             /* Reset stavu letu a EMA filtru pro nový záznam */
@@ -690,8 +741,7 @@ int main(void) {
             was_recording = false;
             printf("Recording stopped. %u samples saved.\n", num_samples);
             printf("Use 'dump' to download data as CSV.\n");
-            led_mode = LED_ON;
-            ws2812_put_pixel(led_mode_color());
+            led_set_mode(LED_ON);
         }
 
         // --- Sample data ---
@@ -758,7 +808,7 @@ int main(void) {
                                     gpio_put(PARACHUTE_PIN, 1);
                                     parachute_off_ms = now_ms + PARACHUTE_ACTIVE_MS;
                                     parachute_fired = true;
-                                    led_mode = LED_BLINK_APOGEE;
+                                    led_set_mode(LED_BLINK_APOGEE);
                                     printf("PARACHUTE fired!\n");
                                 }
                             }
@@ -806,7 +856,7 @@ int main(void) {
                 next_sample_us += SAMPLE_INTERVAL_US;
 
                 // If we fell behind, catch up
-                if (next_sample_us < now_us) {
+                if (next_sample_us <= now_us) {
                     next_sample_us = now_us + SAMPLE_INTERVAL_US;
                 }
             }

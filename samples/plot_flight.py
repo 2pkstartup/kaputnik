@@ -29,23 +29,43 @@ LAUNCH_ACCEL_G = 3.0
 
 
 def parse_csv(path):
-    """Načte Kaputnik CSV a vrátí seznamy hodnot."""
+    """Načte Kaputnik CSV a vrátí seznamy hodnot (časy v milisekundách)."""
     epoch_ms, ax, ay, az, gx, gy, gz = [], [], [], [], [], [], []
+    is_epoch_us = False
 
     with open(path, "r") as f:
         reader = csv.reader(f)
-        for row in reader:
-            if not row or row[0].startswith("#"):
+        for row_idx, row in enumerate(reader):
+            if not row:
                 continue
-            if row[0] == "epoch_ms":
+            
+            # Skip firmware header comments
+            if row[0].startswith("#"):
                 continue
-            epoch_ms.append(int(row[0]))
-            ax.append(int(row[1]))
-            ay.append(int(row[2]))
-            az.append(int(row[3]))
-            gx.append(int(row[4]))
-            gy.append(int(row[5]))
-            gz.append(int(row[6]))
+            
+            # Detect header and determine time format
+            if row[0] in ("epoch_ms", "epoch_us"):
+                is_epoch_us = (row[0] == "epoch_us")
+                continue
+            
+            if row[0] == "# END":
+                break
+            
+            try:
+                time_val = int(row[0])
+                # Convert microseconds to milliseconds if needed
+                if is_epoch_us:
+                    time_val = time_val // 1000
+                epoch_ms.append(time_val)
+                ax.append(int(row[1]))
+                ay.append(int(row[2]))
+                az.append(int(row[3]))
+                gx.append(int(row[4]))
+                gy.append(int(row[5]))
+                gz.append(int(row[6]))
+            except (ValueError, IndexError) as e:
+                print(f"Warning: skipped malformed row {row_idx}: {row}", file=sys.stderr)
+                continue
 
     return epoch_ms, ax, ay, az, gx, gy, gz
 
@@ -101,19 +121,29 @@ def integrate_velocity_altitude(t_s, az_g_ema, launch_idx):
 
 def main():
     parser = argparse.ArgumentParser(description="Kaputnik flight data plotter")
-    parser.add_argument("csv", help="CSV soubor s letovými daty")
+    parser.add_argument("csv", nargs="?", default="sample_flight.csv", help="CSV soubor s letovými daty (výchozí: sample_flight.csv)")
     parser.add_argument("-o", "--output", help="Uložit graf do souboru (PNG/SVG/PDF)")
     args = parser.parse_args()
 
-    epoch_ms, ax, ay, az, gx, gy, gz = parse_csv(args.csv)
+    try:
+        epoch_ms, ax, ay, az, gx, gy, gz = parse_csv(args.csv)
+    except FileNotFoundError:
+        print(f"Error: CSV soubor '{args.csv}' nenalezen.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error při načítání CSV: {e}", file=sys.stderr)
+        sys.exit(1)
+    
     n = len(epoch_ms)
     if n == 0:
-        print("No data found.", file=sys.stderr)
-        return
+        print("Error: Žádná data v CSV souboru.", file=sys.stderr)
+        sys.exit(1)
 
-    # Čas v sekundách od začátku záznamu
+    # Čas v sekundách od začátku záznamu (epoch_ms je v ms, takže /1000)
     t0 = epoch_ms[0]
     t_s = [(e - t0) / 1000.0 for e in epoch_ms]
+    
+    print(f"Loaded {n} samples, duration {t_s[-1]:.2f} s", file=sys.stderr)
 
     # Převod na fyzikální jednotky
     ax_g = [v / ACCEL_LSB_PER_G for v in ax]

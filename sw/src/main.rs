@@ -6,9 +6,10 @@
 //!
 //!  Podporované příkazy:
 //!    dump   – stažení letových dat jako CSV (s progress barem)
+//!    save   – stažení dat a uložení do CSV pojmenovaného podle času záznamu
 //!    status – zobrazení stavu zařízení (MPU, flash, čas, záznam)
 //!    erase  – smazání celé flash paměti
-//!    start  – synchronizace času + spuštění záznamu vzdáleně
+//!    start  – vymazání flash + synchronizace času + spuštění záznamu vzdáleně
 //!    stop   – zastavení záznamu vzdáleně
 //!    list   – výpis dostupných sériových portů
 //!
@@ -51,11 +52,13 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Stáhnout data a uložit do CSV s názvem podle času záznamu
+    Save,
     /// Zobrazit stav zařízení
     Status,
     /// Smazat flash paměť
     Erase,
-    /// Spustit záznam
+    /// Vymazat flash, synchronizovat čas a spustit záznam
     Start,
     /// Zastavit záznam
     Stop,
@@ -187,6 +190,33 @@ fn read_lines(port: &mut Box<dyn serialport::SerialPort>) -> Result<Vec<String>>
 }
 
 // =========================================================================
+//  Pomocná funkce: formátování epoch sekund → řetězec pro název souboru
+// =========================================================================
+
+fn epoch_secs_to_datetime_str(epoch_secs: u64) -> String {
+    let secs_per_day = 86400u64;
+    let time_of_day = epoch_secs % secs_per_day;
+    let days = epoch_secs / secs_per_day;
+    let hour = time_of_day / 3600;
+    let min = (time_of_day % 3600) / 60;
+    let sec = time_of_day % 60;
+
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}{:02}{:02}_{:02}{:02}{:02}", y, m, d, hour, min, sec)
+}
+
+// =========================================================================
 //  Příkaz: dump – stahování letových dat
 //
 //  Průběh:
@@ -304,6 +334,125 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
 }
 
 // =========================================================================
+//  Příkaz: save – stažení dat do CSV pojmenovaného podle času záznamu
+//
+//  Přečte "# Epoch start:" z hlavičky dump výstupu a vygeneruje
+//  název souboru ve tvaru flight_YYYYMMDD_HHMMSS.csv.
+// =========================================================================
+
+fn cmd_save(port_name: &str, baud: u32) -> Result<()> {
+    let mut port = open_port(port_name, baud)?;
+
+    // Opening CDC serial on RP2040 can reset the firmware; wait for boot banner.
+    std::thread::sleep(Duration::from_millis(2800));
+    port.set_timeout(Duration::from_millis(250))?;
+    let _ = read_lines(&mut port);
+
+    // Stop recording first so the header gets written to flash.
+    port.set_timeout(Duration::from_secs(5))?;
+    eprintln!("Stopping recording...");
+    send_command(&mut port, "stop")?;
+    let stop_lines = read_lines(&mut port)?;
+    for line in &stop_lines {
+        eprintln!("{line}");
+    }
+    // Give firmware time to flush page buffer and write header
+    std::thread::sleep(Duration::from_millis(500));
+
+    port.set_timeout(Duration::from_secs(2))?;
+    eprintln!("Requesting data dump...");
+    send_command(&mut port, "dump")?;
+
+    let mut reader = BufReader::new(port.try_clone()?);
+    let mut line = String::new();
+
+    let mut total_samples: u64 = 0;
+    let mut epoch_ms_start: u64 = 0;
+    let mut header_lines: Vec<String> = Vec::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => bail!("Connection closed unexpectedly"),
+            Ok(_) => {
+                let trimmed = line.trim().to_string();
+                if let Some(n) = trimmed.strip_prefix("# Samples:") {
+                    total_samples = n.trim().parse().unwrap_or(0);
+                }
+                if let Some(n) = trimmed.strip_prefix("# Epoch start:") {
+                    epoch_ms_start = n.trim().parse().unwrap_or(0);
+                }
+                header_lines.push(trimmed.clone());
+                if trimmed.starts_with("ERROR") {
+                    bail!("{trimmed}");
+                }
+                if !trimmed.starts_with('#') {
+                    break; // CSV header line
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                bail!("Timeout waiting for data");
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let filename = if epoch_ms_start > 0 {
+        format!("flight_{}.csv", epoch_secs_to_datetime_str(epoch_ms_start / 1000))
+    } else {
+        "flight_unknown.csv".to_string()
+    };
+
+    eprintln!("Saving to {filename}");
+    let mut out = File::create(&filename)
+        .with_context(|| format!("Cannot create {filename}"))?;
+
+    for hl in &header_lines {
+        writeln!(out, "{hl}")?;
+    }
+
+    let pb = if total_samples > 0 {
+        let pb = ProgressBar::new(total_samples);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} samples ({eta})")?                .progress_chars("=>-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    let mut count: u64 = 0;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed == "# END" {
+                    writeln!(out, "{trimmed}")?;
+                    break;
+                }
+                writeln!(out, "{trimmed}")?;
+                count += 1;
+                if let Some(ref pb) = pb {
+                    pb.set_position(count);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    if let Some(pb) = pb {
+        pb.finish_with_message("done");
+    }
+
+    eprintln!("Downloaded {count} samples → {filename}");
+    Ok(())
+}
+
+// =========================================================================
 //  Příkaz: jednoduché operace (status, erase, start, stop)
 //
 //  Pošle příkaz a vypíše všechny řádky odpovědi.
@@ -341,40 +490,69 @@ fn cmd_start(port_name: &str, baud: u32) -> Result<()> {
 
     let mut port = open_port(port_name, baud)?;
 
-    send_command(&mut port, &settime_cmd)?;
-    let sync_lines = read_lines(&mut port)?;
-    for line in &sync_lines {
-        println!("{line}");
+    // Opening CDC serial on RP2040 can reset the firmware; wait until it is ready
+    // to process commands and drain any boot banner output.
+    std::thread::sleep(Duration::from_millis(2800));
+    port.set_timeout(Duration::from_millis(250))?;
+    let _ = read_lines(&mut port);
+
+    port.set_timeout(Duration::from_secs(5))?;
+
+    let mut sync_ok = false;
+    for attempt in 1..=3 {
+        send_command(&mut port, &settime_cmd)?;
+        let sync_lines = read_lines(&mut port)?;
+        for line in &sync_lines {
+            println!("{line}");
+        }
+
+        sync_ok = sync_lines
+            .iter()
+            .any(|line| line.starts_with("SYNC OK") || line.starts_with("Time set."));
+        if sync_ok {
+            break;
+        }
+
+        eprintln!("Time sync not confirmed (attempt {attempt}/3), retrying...");
+        std::thread::sleep(Duration::from_millis(300));
     }
 
-    let sync_ok = sync_lines
-        .iter()
-        .any(|line| line.starts_with("SYNC OK") || line.starts_with("Time set."));
     if !sync_ok {
         bail!("Device did not confirm time sync");
     }
     eprintln!("Time sync confirmed.");
 
     eprintln!("Starting recording...");
-    send_command(&mut port, "start")?;
 
-    let start_lines = read_lines(&mut port)?;
-    for line in &start_lines {
-        println!("{line}");
+    let mut led_ok = false;
+    let mut start_ok = false;
+    for attempt in 1..=3 {
+        send_command(&mut port, "start")?;
+        let start_lines = read_lines(&mut port)?;
+        for line in &start_lines {
+            println!("{line}");
+        }
+
+        start_ok = start_lines.iter().any(|line| {
+            line.starts_with("START OK")
+                || line.contains("Recording started")
+                || line.contains("already recording")
+        });
+        led_ok = start_lines
+            .iter()
+            .any(|line| line.contains("LED: BLUE BLINK"));
+
+        if start_ok {
+            break;
+        }
+
+        eprintln!("Start not confirmed (attempt {attempt}/3), retrying...");
+        std::thread::sleep(Duration::from_millis(300));
     }
 
-    let start_ok = start_lines.iter().any(|line| {
-        line.starts_with("START OK")
-            || line.contains("Recording started")
-            || line.contains("already recording")
-    });
     if !start_ok {
         bail!("Device did not confirm recording start");
     }
-
-    let led_ok = start_lines
-        .iter()
-        .any(|line| line.contains("LED: BLUE BLINK"));
     if led_ok {
         eprintln!("Start confirmed. LED switched to blue blink.");
     } else {
@@ -432,6 +610,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Dump { output } => cmd_dump(&port_name, cli.baud, output),
+        Commands::Save => cmd_save(&port_name, cli.baud),
         Commands::Status => cmd_simple(&port_name, cli.baud, "status"),
         Commands::Erase => {
             eprintln!("Erasing flash... this may take a while.");

@@ -60,8 +60,8 @@
 /* -----------------------------------------------------------------------
  *  Layout dat na flash paměti
  *
- *  Stránka 0 (256 B):  Hlavička záznamu (flash_header_t)
- *  Stránky 1+:         Data (sample_record_t × N)
+ *  Sektor 0 (4 KB, 0x000000–0x000FFF):  Hlavička záznamu (flash_header_t)
+ *  Sektory 1+    (od 0x001000):          Data (sample_record_t × N)
  *
  *  Sektory:  4 KB (nejmenší mazetelná jednotka)
  *  Stránky:  256 B (jednotka programování)
@@ -69,7 +69,7 @@
 #define FLASH_PAGE_SIZE     256
 #define FLASH_SECTOR_SIZE   4096
 #define FLASH_TOTAL_SIZE    (8 * 1024 * 1024) /* 8 MB = 64 Mbit             */
-#define FLASH_DATA_START    FLASH_PAGE_SIZE    /* Data začínají na stránce 1 */
+#define FLASH_DATA_START    FLASH_SECTOR_SIZE  /* Data začínají na sektoru 1 */
 #define FLASH_MAX_RECORDS   ((FLASH_TOTAL_SIZE - FLASH_DATA_START) / sizeof(sample_record_t))
 
 /* -----------------------------------------------------------------------
@@ -102,6 +102,6 @@
  *  Identifikace datového formátu
  * ----------------------------------------------------------------------- */
 #define DATA_MAGIC  0x5550414B  /* ASCII "KAPU" (little-endian)              */
-#define DATA_VERSION 4          /* Verze formátu (v4 = + mx,my,mz,mag_valid) */
+#define DATA_VERSION 5          /* Verze formátu (v5 = FLASH_DATA_START na sektoru 1) */
 
 #endif /* CONFIG_H */
