@@ -3,7 +3,7 @@
  *
  * Cílová deska: Waveshare RP2040-Zero
  *
- * Všechny GPIO piny a konstanty pro periferie (MPU-6500, W25Q64, tlačítko,
+ * Všechny GPIO piny a konstanty pro periferie (GY-9250 / MPU-9250, W25Q64, tlačítko,
  * LED, padák) a parametry záznamu (vzorkovací frekvence, rozsahy, layout
  * dat na flash) jsou definovány zde na jednom místě.
  */
@@ -12,8 +12,8 @@
 #define CONFIG_H
 
 /* -----------------------------------------------------------------------
- *  MPU-6500 IMU na SPI0
- *  3-osý akcelerometr + gyroskop (InvenSense/TDK)
+ *  GY-9250 IMU modul na SPI0
+ *  Použitá část: 3-osý akcelerometr + gyroskop (MPU-6500 / MPU-9250)
  * ----------------------------------------------------------------------- */
 #define MPU_SPI_PORT    spi0
 #define MPU_SPI_FREQ    1000000  /* 1 MHz – bezpečná frekvence pro SPI     */
@@ -52,7 +52,7 @@
 #define SAMPLE_INTERVAL_US (1000000 / SAMPLE_RATE_HZ) /* Perioda vzorkování [µs]   */
 
 /* -----------------------------------------------------------------------
- *  Nastavení MPU-6500
+ *  Nastavení MPU-6500 / MPU-9250
  * ----------------------------------------------------------------------- */
 #define MPU_ACCEL_RANGE_G   16   /* ±16g – plný rozsah pro raketové lety    */
 #define MPU_GYRO_RANGE_DPS  2000 /* ±2000 °/s – plný rozsah                 */
@@ -102,6 +102,6 @@
  *  Identifikace datového formátu
  * ----------------------------------------------------------------------- */
 #define DATA_MAGIC  0x5550414B  /* ASCII "KAPU" (little-endian)              */
-#define DATA_VERSION 3          /* Verze formátu (v3 = + gp14 stav ve vzorku) */
+#define DATA_VERSION 4          /* Verze formátu (v4 = + mx,my,mz,mag_valid) */
 
 #endif /* CONFIG_H */

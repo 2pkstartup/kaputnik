@@ -1,6 +1,6 @@
 # Kaputnik – Flight Data Logger pro modelářské rakety
 
-Flight data logger postavený na **RP2040** se snímačem **MPU-6500** (3-osý akcelerometr + gyroskop) a externí **W25Q64** SPI flash pamětí (64 Mbit / 8 MB).
+Flight data logger postavený na **RP2040** se snímačem **GY-9250** (použitý accel/gyro blok **MPU-9250**) a externí **W25Q64** SPI flash pamětí (64 Mbit / 8 MB).
 
 Cílem projektu je zaznamenávat letová data modelu rakety, detekovat horní úvrať (apogee) a automaticky aktivovat padák.
 
@@ -9,7 +9,7 @@ Cílem projektu je zaznamenávat letová data modelu rakety, detekovat horní ú
 | Komponenta | Popis |
 |---|---|
 | MCU | RP2040 (Waveshare RP2040-Zero) |
-| IMU | MPU-6500 – 3-osý akcelerometr + gyroskop, SPI |
+| IMU | GY-9250 – 3-osý akcelerometr + gyroskop přes MPU-9250, SPI |
 | Flash | Winbond W25Q64FVSSIQ – 64 Mbit SPI flash |
 | Tlačítko | Start/stop záznamu (active low, interní pull-up) |
 | LED | WS2812B RGB NeoPixel (onboard) – barevná indikace stavu |
@@ -18,7 +18,7 @@ Cílem projektu je zaznamenávat letová data modelu rakety, detekovat horní ú
 
 | Periferie | SCK | MOSI | MISO | CS |
 |---|---|---|---|---|
-| MPU-6500 (SPI0) | GP2 | GP3 | GP4 | GP5 |
+| GY-9250 / MPU-9250 (SPI0) | GP2 | GP3 | GP4 | GP5 |
 | W25Q64 (SPI1) | GP10 | GP11 | GP12 | GP13 |
 
 | Funkce | Pin |
@@ -29,8 +29,8 @@ Cílem projektu je zaznamenávat letová data modelu rakety, detekovat horní ú
 
 ## Funkce
 
-- Po stisku tlačítka (nebo USB příkazu `start`) se spustí záznam dat z MPU-6500 na **500 Hz**
-- Každý vzorek (17 bytů): timestamp (µs), 3× akcelerometr, 3× gyroskop (raw int16), stav GP14
+- Po stisku tlačítka (nebo USB příkazu `start`) se spustí záznam dat z GY-9250 na **500 Hz**
+- Každý vzorek (24 bytů): timestamp (µs), 3× akcelerometr, 3× gyroskop (raw int16), stav GP14, 3× magnetometr + valid flag
 - Data se zapisují na externí W25Q64 flash (stránkovaný zápis po 256 B)
 - Kapacita: cca **500 000 vzorků** (~16 minut záznamu)
 - Opětovný stisk tlačítka nebo příkaz `stop` zastaví záznam
@@ -45,7 +45,7 @@ Cílem projektu je zaznamenávat letová data modelu rakety, detekovat horní ú
 | 🟢 Zelená | Trvale svítí | Připraveno (ready) |
 | 🔵 Modrá | Bliká pomalu (500 ms) | Probíhá záznam |
 | � Fialová | Bliká (300 ms) | Apogee detekováno, padák aktivován |
-| �🔴 Červená | Bliká rychle (100 ms) | Chyba MPU-6500 |
+| �🔴 Červená | Bliká rychle (100 ms) | Chyba IMU (GY-9250 / MPU-9250) |
 | 🟡 Žlutá | Bliká rychleji (200 ms) | Chyba W25Q64 flash |
 
 ### USB příkazy
@@ -64,20 +64,20 @@ Připojte se sériovým terminálem (115200 baud):
 ### CSV formát výstupu
 
 ```
-# KAPUTNIK Flight Data v3
+# KAPUTNIK Flight Data v4
 # Sample rate: 500 Hz
 # Samples: 12345
 # Accel range: +/-16 g
 # Gyro range: +/-2000 dps
 # Epoch start: 1776556800000
-epoch_ms,ax,ay,az,gx,gy,gz,gp14
-1776556800000,123,-456,16384,10,-5,2,0
-1776556800002,125,-460,16380,12,-3,1,0
+epoch_ms,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid
+1776556800000,123,-456,16384,10,-5,2,0,-112,85,403,1
+1776556800002,125,-460,16380,12,-3,1,0,0,0,0,0
 ...
 # END
 ```
 
-Každý záznam obsahuje absolutní časový otisk `epoch_ms` (milisekundy od 1.1.1970) a stav výstupu `gp14` (0/1). Vyžaduje synchronizaci hodin před záznamem.
+Každý záznam obsahuje absolutní časový otisk `epoch_ms` (milisekundy od 1.1.1970), stav výstupu `gp14` (0/1) a hodnoty magnetometru `mx,my,mz`. Sloupec `mag_valid` je 1 pouze pokud byl magnetometrický vzorek v daný okamžik validní.
 
 ## EMA filtr – vyhlazování dat pro detekci apogea
 
@@ -214,7 +214,7 @@ Všechny parametry detekce jsou v `fw/src/config.h`:
 | `PARACHUTE_ACTIVE_MS` | 1000 | Doba aktivace padákového pinu [ms] |
 | `ACCEL_LSB_PER_G` | 2048 | Převodní konstanta LSB/g při ±16g |
 
-## Nastavení MPU-6500
+## Nastavení GY-9250 / MPU-9250
 
 | Parametr | Hodnota |
 |---|---|
@@ -223,7 +223,7 @@ Všechny parametry detekce jsou v `fw/src/config.h`:
 | DLPF bandwidth | ~92 Hz (hardwarový low-pass v čipu) |
 | Vzorkovací frekvence | 500 Hz |
 
-> **Poznámka:** DLPF (Digital Low-Pass Filter) v MPU-6500 na ~92 Hz je **první stupeň filtrace** přímo v hardware čipu. EMA filtr ve firmware je **druhý stupeň**, který dále vyhladí data pro detekci apogea.
+> **Poznámka:** DLPF (Digital Low-Pass Filter) v MPU-9250 na ~92 Hz je **první stupeň filtrace** přímo v hardware čipu. EMA filtr ve firmware je **druhý stupeň**, který dále vyhladí data pro detekci apogea.
 
 ## Build
 
@@ -340,7 +340,7 @@ kaputnik/
 │   └── src/
 │       ├── config.h             – definice pinů, parametry snímání
 │       ├── main.c               – hlavní logika (záznam, USB příkazy, LED)
-│       ├── mpu6500.h/c          – SPI driver pro MPU-6500
+│       ├── imu.h/c              – SPI driver pro MPU-6500 / MPU-9250 + AK8963
 │       ├── w25q64.h/c           – SPI driver pro W25Q64 flash
 │       ├── ws2812.h/c           – PIO driver pro WS2812B RGB LED
 │       └── ws2812.pio           – PIO program pro WS2812B protokol

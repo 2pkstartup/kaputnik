@@ -13,7 +13,7 @@ pico_sdk_init()
 
 add_executable(kaputnik
     src/main.c
-    src/mpu6500.c
+    src/imu.c
     src/w25q64.c
     src/ws2812.c
 )

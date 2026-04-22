@@ -192,7 +192,7 @@ fn read_lines(port: &mut Box<dyn serialport::SerialPort>) -> Result<Vec<String>>
 //  Průběh:
 //  1. Pošle "dump" na zařízení
 //  2. Přečte hlavičkové řádky (začínají #) – z nich získá počet vzorků
-//  3. Přečte CSV hlavičku (epoch_ms,ax,ay,az,gx,gy,gz)
+//  3. Přečte CSV hlavičku (epoch_ms,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid)
 //  4. Čte datové řádky s progress barem dokud nepřijde "# END"
 //  5. Zapisuje do souboru (-o) nebo na stdout
 // =========================================================================

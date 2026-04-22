@@ -10,7 +10,7 @@
  *              USB sériová komunikace pro stahování dat a ovládání.
  *
  *  MCU:        RP2040 (Waveshare RP2040-Zero)
- *  IMU:        InvenSense MPU-6500  (3-osý akcelerometr + gyroskop, SPI)
+ *  IMU:        GY-9250 modul (MPU-6500 / MPU-9250 accel+gyro přes SPI)
  *  Flash:      Winbond W25Q64FVSSIQ (64 Mbit / 8 MB, SPI)
  *  LED:        WS2812B RGB NeoPixel (onboard na RP2040-Zero, PIO)
  *
@@ -18,7 +18,7 @@
  *  ZAPOJENÍ PINŮ  (Waveshare RP2040-Zero)
  * --------------------------------------------------------------------------
  *
- *  MPU-6500 (SPI0):
+ *  GY-9250 / MPU-9250 (SPI0):
  *      GP2  ── SCK   (SPI0 SCK)
  *      GP3  ── MOSI  (SPI0 TX)
  *      GP4  ── MISO  (SPI0 RX)
@@ -43,13 +43,15 @@
  * --------------------------------------------------------------------------
  *
  *  Stránka 0 (256 B):  flash_header_t – magic, verze, počet vzorků, epoch
- *  Stránky 1+:         sample_record_t – 17 B na záznam
+ *  Stránky 1+:         sample_record_t – 24 B na záznam
  *
- *  Jeden záznam (17 B, packed):
+ *  Jeden záznam (24 B, packed):
  *      uint32_t timestamp_us   – čas od začátku záznamu [µs]
  *      int16_t  ax, ay, az     – raw akcelerometr (±16g → ±32768)
  *      int16_t  gx, gy, gz     – raw gyroskop (±2000°/s → ±32768)
  *      uint8_t  gp14_state     – stav padákového výstupu GP14 (0/1)
+ *      int16_t  mx, my, mz     – raw magnetometr AK8963
+ *      uint8_t  mag_valid      – 1 pokud jsou mx/my/mz validní
  *
  *  Kapacita: ~500 000 vzorků ≈ 16 minut při 500 Hz
  *
@@ -59,7 +61,7 @@
  *
  *      start              – spustit záznam
  *      stop               – zastavit záznam
- *      dump               – vypsat data jako CSV (epoch_ms,ax,ay,az,gx,gy,gz,gp14)
+ *      dump               – vypsat data jako CSV (epoch_ms,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid)
  *      erase              – smazat celou flash
  *      status             – stav zařízení (MPU, flash, čas, záznam)
  *      settime <epoch_s>  – nastavit vnitřní hodiny (epoch sekundy od 1970)
@@ -71,7 +73,7 @@
  *      Zelená (svítí)           – připraveno (ready)
  *      Modrá (bliká 500 ms)    – probíhá záznam
  *      Fialová (bliká 300 ms)  – apogee detekováno, padák aktivován
- *      Červená (bliká 100 ms)  – chyba MPU-6500
+ *      Červená (bliká 100 ms)  – chyba IMU
  *      Žlutá (bliká 200 ms)   – chyba W25Q64 flash
  *
  * --------------------------------------------------------------------------
@@ -102,7 +104,7 @@
 #include "hardware/timer.h"
 
 #include "config.h"
-#include "mpu6500.h"
+#include "imu.h"
 #include "w25q64.h"
 #include "ws2812.h"
 
@@ -112,22 +114,24 @@
  *
  *  Flash layout:
  *    Adresa 0x000000 .. 0x0000FF  →  flash_header_t (1 stránka = 256 B)
- *    Adresa 0x000100 .. 0x7FFFFF  →  sample_record_t (17 B × N)
+ *    Adresa 0x000100 .. 0x7FFFFF  →  sample_record_t (24 B × N)
  *
- *  Každá stránka (256 B) pojme floor(256/17)=15 záznamů.
+ *  Každá stránka (256 B) pojme floor(256/24)=10 záznamů.
  *  Zápis probíhá stránkově – záznamy se bufferují v RAM a zapisují
  *  najednou po naplnění 256B bufferu.
  * ======================================================================= */
 
-/* Jeden vzorek letových dat – 17 bytů, packed pro přesné zarovnání na flash */
+/* Jeden vzorek letových dat – 24 bytů, packed pro přesné zarovnání na flash */
 typedef struct __attribute__((packed)) {
     uint32_t timestamp_us;  /* Čas od začátku záznamu [µs]                   */
     int16_t  ax, ay, az;    /* Raw akcelerometr (LSB, ±16g → ±32768)         */
     int16_t  gx, gy, gz;    /* Raw gyroskop     (LSB, ±2000°/s → ±32768)     */
     uint8_t  gp14_state;    /* Stav GPIO GP14 (padákový výstup): 0/1         */
-} sample_record_t;          /* Celkem: 4 + 6×2 + 1 = 17 bytů                 */
+    int16_t  mx, my, mz;    /* Raw AK8963 magnetometr                         */
+    uint8_t  mag_valid;     /* 1 pokud je magnetometrický vzorek validní      */
+} sample_record_t;          /* Celkem: 4 + 6×2 + 1 + 3×2 + 1 = 24 bytů       */
 
-_Static_assert(sizeof(sample_record_t) == 17, "sample_record_t must be 17 bytes");
+_Static_assert(sizeof(sample_record_t) == 24, "sample_record_t must be 24 bytes");
 
 /* Hlavička záznamu – uložena na stránce 0 flash po ukončení záznamu */
 typedef struct __attribute__((packed)) {
@@ -166,7 +170,7 @@ static bool ema_initialized = false;               /* false = první vzorek   */
 
 /* Aktualizuje EMA filtr na všech 6 osách. Při prvním volání inicializuje
  * stav filtru přímo na vstupní hodnotu (bez přechodového jevu). */
-static void ema_update(const mpu6500_data_t *d) {
+static void ema_update(const imu_data_t *d) {
     if (!ema_initialized) {
         ema_ax = d->accel_x; ema_ay = d->accel_y; ema_az = d->accel_z;
         ema_gx = d->gyro_x;  ema_gy = d->gyro_y;  ema_gz = d->gyro_z;
@@ -254,7 +258,7 @@ static void flush_page_buf(void) {
 }
 
 /* Přidá jeden záznam do stránkového bufferu.
- * Po naplnění 16 záznamů (256 B) automaticky zapíše na flash. */
+ * Po zaplnění 256B stránky automaticky zapíše na flash. */
 static void write_record(const sample_record_t *rec) {
     memcpy(page_buf + page_buf_pos, rec, sizeof(sample_record_t));
     page_buf_pos += sizeof(sample_record_t);
@@ -298,6 +302,15 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(sample_record_v2_t) == 16, "sample_record_v2_t must be 16 bytes");
 
+typedef struct __attribute__((packed)) {
+    uint32_t timestamp_us;
+    int16_t  ax, ay, az;
+    int16_t  gx, gy, gz;
+    uint8_t  gp14_state;
+} sample_record_v3_t;
+
+_Static_assert(sizeof(sample_record_v3_t) == 17, "sample_record_v3_t must be 17 bytes");
+
 static void process_command(const char *cmd) {
     if (strcmp(cmd, "dump") == 0) {
         // Read header
@@ -315,19 +328,35 @@ static void process_command(const char *cmd) {
         printf("# Accel range: +/-%u g\n", hdr.accel_range);
         printf("# Gyro range: +/-%u dps\n", hdr.gyro_range);
         printf("# Epoch start: %llu\n", hdr.epoch_ms_start);
-        printf("epoch_ms,ax,ay,az,gx,gy,gz,gp14\n");
+        printf("epoch_ms,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid\n");
 
         uint32_t addr = FLASH_DATA_START;
-        if (hdr.version >= 3) {
+        if (hdr.version >= 4) {
             sample_record_t rec;
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
                 w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
                 uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
-                printf("%llu,%d,%d,%d,%d,%d,%d,%u\n",
+                printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
                        epoch_ms,
                        rec.ax, rec.ay, rec.az,
                        rec.gx, rec.gy, rec.gz,
-                       rec.gp14_state);
+                       rec.gp14_state,
+                       rec.mx, rec.my, rec.mz,
+                       rec.mag_valid);
+                addr += sizeof(rec);
+            }
+        } else if (hdr.version >= 3) {
+            sample_record_v3_t rec;
+            for (uint32_t i = 0; i < hdr.num_samples; i++) {
+                w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
+                uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
+                printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
+                       epoch_ms,
+                       rec.ax, rec.ay, rec.az,
+                       rec.gx, rec.gy, rec.gz,
+                       rec.gp14_state,
+                       0, 0, 0,
+                       0u);
                 addr += sizeof(rec);
             }
         } else {
@@ -335,10 +364,12 @@ static void process_command(const char *cmd) {
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
                 w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
                 uint64_t epoch_ms = hdr.epoch_ms_start + (uint64_t)(rec.timestamp_us / 1000);
-                printf("%llu,%d,%d,%d,%d,%d,%d,%u\n",
+                printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
                        epoch_ms,
                        rec.ax, rec.ay, rec.az,
                        rec.gx, rec.gy, rec.gz,
+                       0u,
+                       0, 0, 0,
                        0u);
                 addr += sizeof(rec);
             }
@@ -368,7 +399,17 @@ static void process_command(const char *cmd) {
         } else {
             printf("Flash data: empty/invalid\n");
         }
-        printf("MPU-6500 WHO_AM_I: 0x%02X\n", mpu6500_who_am_i());
+        printf("IMU WHO_AM_I: 0x%02X\n", imu_who_am_i());
+        if (imu_mag_is_available()) {
+            imu_mag_data_t mag;
+            if (imu_mag_read(&mag)) {
+                printf("AK8963 MAG: %d,%d,%d\n", mag.mag_x, mag.mag_y, mag.mag_z);
+            } else {
+                printf("AK8963 MAG: available, no fresh sample\n");
+            }
+        } else {
+            printf("AK8963 MAG: not available\n");
+        }
         printf("W25Q64 JEDEC ID: 0x%06X\n", w25q64_read_jedec_id());
 
     } else if (strcmp(cmd, "start") == 0) {
@@ -441,7 +482,7 @@ typedef enum {
     LED_OFF,          /* Vypnuto                                          */
     LED_ON,           /* Trvale zelená – připraveno ke startu             */
     LED_BLINK_SLOW,   /* Modrá, bliká 500 ms – probíhá záznam            */
-    LED_BLINK_FAST,   /* Červená, bliká 100 ms – chyba inicializace MPU  */
+    LED_BLINK_FAST,   /* Červená, bliká 100 ms – chyba inicializace IMU  */
     LED_BLINK_FASTER, /* Žlutá, bliká 200 ms – chyba inicializace flash  */
     LED_BLINK_APOGEE, /* Fialová, bliká 300 ms – apogee detekováno       */
 } led_mode_t;
@@ -500,7 +541,7 @@ static void led_update(void) {
 /* =======================================================================
  *  Hlavní funkce – main()
  *
- *  1. Inicializace periferií (LED, tlačítko, padák, MPU-6500, W25Q64)
+ *  1. Inicializace periferií (LED, tlačítko, padák, IMU, W25Q64)
  *  2. Čekání na USB připojení (2 s)
  *  3. Nekonečná smyčka:
  *     a) Příjem USB příkazů (neblokující čtení znaků)
@@ -532,13 +573,18 @@ int main(void) {
 
     printf("\n=== KAPUTNIK Flight Logger ===\n");
 
-    // Init MPU-6500
-    if (!mpu6500_init()) {
-        printf("ERROR: MPU-6500 init failed (WHO_AM_I: 0x%02X)\n", mpu6500_who_am_i());
+    // Init IMU (GY-9250 / MPU-6500 / MPU-9250)
+    if (!imu_init()) {
+        printf("ERROR: IMU init failed (WHO_AM_I: 0x%02X)\n", imu_who_am_i());
         led_mode = LED_BLINK_FAST;
         while (1) { led_update(); }
     }
-    printf("MPU-6500 OK (WHO_AM_I: 0x%02X)\n", mpu6500_who_am_i());
+    printf("IMU OK (WHO_AM_I: 0x%02X)\n", imu_who_am_i());
+    if (imu_mag_is_available()) {
+        printf("AK8963 MAG OK\n");
+    } else {
+        printf("AK8963 MAG unavailable\n");
+    }
 
     // Init W25Q64
     if (!w25q64_init()) {
@@ -579,8 +625,8 @@ int main(void) {
         float sum_az = 0;
         const int CAL_SAMPLES = 200; /* 200 vzorků = 0.4 s */
         for (int i = 0; i < CAL_SAMPLES; i++) {
-            mpu6500_data_t cal;
-            mpu6500_read_all(&cal);
+            imu_data_t cal;
+            imu_read_all(&cal);
             sum_az += cal.accel_z;
             sleep_ms(2);
         }
@@ -660,8 +706,8 @@ int main(void) {
                     continue;
                 }
 
-                mpu6500_data_t mpu_data;
-                mpu6500_read_all(&mpu_data);
+                imu_data_t mpu_data;
+                imu_read_all(&mpu_data);
 
                 /* -- EMA filtr – vyhlazení surových dat --------------------- */
                 ema_update(&mpu_data);
@@ -741,6 +787,18 @@ int main(void) {
                 rec.gy = mpu_data.gyro_y;
                 rec.gz = mpu_data.gyro_z;
                 rec.gp14_state = (uint8_t)gpio_get(PARACHUTE_PIN);
+                imu_mag_data_t mag_data;
+                if (imu_mag_read(&mag_data)) {
+                    rec.mx = mag_data.mag_x;
+                    rec.my = mag_data.mag_y;
+                    rec.mz = mag_data.mag_z;
+                    rec.mag_valid = 1;
+                } else {
+                    rec.mx = 0;
+                    rec.my = 0;
+                    rec.mz = 0;
+                    rec.mag_valid = 0;
+                }
 
                 write_record(&rec);
                 num_samples++;
