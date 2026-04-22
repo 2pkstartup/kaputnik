@@ -16,6 +16,8 @@ import csv
 import math
 import sys
 import argparse
+from datetime import datetime, timezone
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -26,6 +28,20 @@ ACCEL_LSB_PER_G = 2048.0
 GYRO_LSB_PER_DPS = 16.384
 EMA_ALPHA = 0.02
 LAUNCH_ACCEL_G = 3.0
+
+
+def find_latest_csv(search_dir="."):
+    """Vrátí cestu k nejnovějšímu CSV souboru v zadané složce."""
+    csv_files = list(Path(search_dir).glob("*.csv"))
+    if not csv_files:
+        raise FileNotFoundError(f"V adresáři '{search_dir}' nebyl nalezen žádný CSV soubor.")
+    return max(csv_files, key=lambda p: p.stat().st_mtime)
+
+
+def format_epoch_ms(epoch_ms):
+    """Převede epoch ms na čitelný UTC čas."""
+    dt = datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
 
 
 def parse_csv(path):
@@ -121,14 +137,22 @@ def integrate_velocity_altitude(t_s, az_g_ema, launch_idx):
 
 def main():
     parser = argparse.ArgumentParser(description="Kaputnik flight data plotter")
-    parser.add_argument("csv", nargs="?", default="sample_flight.csv", help="CSV soubor s letovými daty (výchozí: sample_flight.csv)")
+    parser.add_argument("csv", nargs="?", help="CSV soubor s letovými daty (když není uveden, vezme se nejnovější *.csv)")
     parser.add_argument("-o", "--output", help="Uložit graf do souboru (PNG/SVG/PDF)")
     args = parser.parse_args()
 
+    if args.csv:
+        csv_path = Path(args.csv)
+    else:
+        csv_path = find_latest_csv(".")
+        print(f"Auto-selected latest CSV: {csv_path}", file=sys.stderr)
+
+    output_path = Path(args.output) if args.output else csv_path.with_suffix(".png")
+
     try:
-        epoch_ms, ax, ay, az, gx, gy, gz = parse_csv(args.csv)
+        epoch_ms, ax, ay, az, gx, gy, gz = parse_csv(str(csv_path))
     except FileNotFoundError:
-        print(f"Error: CSV soubor '{args.csv}' nenalezen.", file=sys.stderr)
+        print(f"Error: CSV soubor '{csv_path}' nenalezen.", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"Error při načítání CSV: {e}", file=sys.stderr)
@@ -249,13 +273,23 @@ def main():
     fig.legend(handles=phase_patches, loc="lower center", ncol=4, fontsize=9,
                framealpha=0.9, edgecolor="gray")
 
+    # Časový otisk grafu + zdrojového CSV
+    start_time_str = format_epoch_ms(epoch_ms[0])
+    generated_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    fig.text(
+        0.995,
+        0.005,
+        f"source: {csv_path.name} | start: {start_time_str} | generated: {generated_str}",
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        color="#444444",
+    )
+
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])
 
-    if args.output:
-        fig.savefig(args.output, dpi=150, bbox_inches="tight")
-        print(f"Saved → {args.output}", file=sys.stderr)
-    else:
-        plt.show()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved -> {output_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

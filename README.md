@@ -59,25 +59,25 @@ Připojte se sériovým terminálem (115200 baud):
 | `dump` | Vypíše data jako CSV |
 | `erase` | Smaže celou flash |
 | `status` | Zobrazí stav zařízení |
-| `settime <epoch_sec>` | Nastaví vnitřní hodiny (epoch sekundy) |
+| `settime <epoch_sec>` | Nastaví vnitřní hodiny (epoch sekundy od 1970) |
 
 ### CSV formát výstupu
 
 ```
-# KAPUTNIK Flight Data v4
+# KAPUTNIK Flight Data v5
 # Sample rate: 500 Hz
 # Samples: 12345
 # Accel range: +/-16 g
 # Gyro range: +/-2000 dps
-# Epoch start: 1776556800000
-epoch_ms,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid
-1776556800000,123,-456,16384,10,-5,2,0,-112,85,403,1
-1776556800002,125,-460,16380,12,-3,1,0,0,0,0,0
+# Epoch start: 1776556800000000
+epoch_us,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid
+1776556800000000,123,-456,16384,10,-5,2,0,-112,85,403,1
+1776556800002000,125,-460,16380,12,-3,1,0,0,0,0,0
 ...
 # END
 ```
 
-Každý záznam obsahuje absolutní časový otisk `epoch_ms` (milisekundy od 1.1.1970), stav výstupu `gp14` (0/1) a hodnoty magnetometru `mx,my,mz`. Sloupec `mag_valid` je 1 pouze pokud byl magnetometrický vzorek v daný okamžik validní.
+Každý záznam obsahuje absolutní časový otisk `epoch_us` (**mikrosekundy** od 1.1.1970), stav výstupu `gp14` (0/1) a hodnoty magnetometru `mx,my,mz`. Sloupec `mag_valid` je 1 pouze pokud byl magnetometrický vzorek v daný okamžik validní.
 
 ## EMA filtr – vyhlazování dat pro detekci apogea
 
@@ -238,7 +238,9 @@ cmake ..
 make -j$(nproc)
 ```
 
-Výstupem je `fw/build/kaputnik.uf2`.
+Výstupem jsou dva cíle:
+- `fw/build/kaputnik.uf2` – hlavní logger (záznam na flash, USB příkazy)
+- `fw/build/kaputnik_imu_usb.uf2` – minimální firmware pro testování IMU (stream CSV přes USB)
 
 ### PC aplikace (sw/)
 
@@ -281,11 +283,12 @@ kaputnik-downloader -p COM5 dump
 kaputnik-downloader -p COM5 start
 kaputnik-downloader -p COM5 stop
 
+# Zastavení záznamu + stažení + automaticky pojmenovaný soubor
+# (kombinuje stop + dump, název souboru odvozen z epoch timestamps)
+kaputnik-downloader -p COM5 save
+
 # Smazání flash
 kaputnik-downloader -p COM5 erase
-
-# `start` automaticky provede synchronizaci času + spuštění záznamu
-kaputnik-downloader -p COM5 start
 ```
 
 Když `-p` neuvedete, nástroj se pokusí port automaticky detekovat (USB zařízení podle metadata). Na Windows se obvykle používá `COMx`, na Linuxu `/dev/ttyACMx`.
@@ -323,11 +326,14 @@ kaputnik-downloader start
 
 # 2. ...let...
 
-# 3. Zastavení záznamu (nebo tlačítkem)
-kaputnik-downloader stop
+# 3. Zastavení záznamu a stažení dat do pojmenovaného CSV
+#    (kombinuje `stop` + `dump`, soubor pojmenuje automaticky podle epoch času)
+kaputnik-downloader save
+# → uloží např. flight_20260422_125915.csv
 
-# 4. Stažení dat
-kaputnik-downloader dump -o flight.csv
+# 4. Vizualizace dat (auto-zvolí nejnovější CSV)
+python3 samples/plot_flight.py
+# → uloží flight_20260422_125915.png
 ```
 
 ## Struktura projektu
@@ -338,17 +344,42 @@ kaputnik/
 │   ├── CMakeLists.txt
 │   ├── pico_sdk_import.cmake
 │   └── src/
-│       ├── config.h             – definice pinů, parametry snímání
-│       ├── main.c               – hlavní logika (záznam, USB příkazy, LED)
-│       ├── imu.h/c              – SPI driver pro MPU-6500 / MPU-9250 + AK8963
+│       ├── config.h             – definice pinů, parametry snímání, layout flash
+│       ├── main.c               – hlavní logika (záznam, USB příkazy, LED, apogee)
+│       ├── main_imu_usb.c       – minimální firmware: IMU CSV stream přes USB (50 Hz)
+│       ├── mpu6500.h/c          – SPI driver pro MPU-6500 / MPU-9250 + AK8963
 │       ├── w25q64.h/c           – SPI driver pro W25Q64 flash
 │       ├── ws2812.h/c           – PIO driver pro WS2812B RGB LED
 │       └── ws2812.pio           – PIO program pro WS2812B protokol
 ├── sw/                          ← PC aplikace (Rust)
 │   ├── Cargo.toml
-│   └── src/main.rs              – CLI downloader
+│   └── src/main.rs              – CLI downloader (dump, save, start, stop, erase, status, list)
+├── samples/
+│   └── plot_flight.py           – vizualizace letového CSV (matplotlib)
 ├── .gitignore
 └── README.md
+```
+
+## Vizualizace dat
+
+Skript `samples/plot_flight.py` vykreslí 4 panely z letového CSV:
+
+1. Akcelerometr (ax, ay, az) – raw LSB + osa v g
+2. Gyroskop (gx, gy, gz) – raw LSB + osa v °/s
+3. Celkové zrychlení |a| s EMA filtrem a detekcí fází letu
+4. Odhadovaná rychlost a výška (numerická integrace)
+
+```bash
+# Instalace závislostí
+pip install matplotlib pandas
+
+# Auto-zvolí nejnovější CSV v aktuálním adresáři
+python3 samples/plot_flight.py
+
+# Nebo konkrétní soubor
+python3 samples/plot_flight.py flight_20260422_125915.csv
+
+# Výsledek: PNG se stejným názvem jako CSV, např. flight_20260422_125915.png
 ```
 
 ## Plánovaný vývoj
@@ -356,12 +387,13 @@ kaputnik/
 - [x] Záznam 6-osých IMU dat na flash (500 Hz)
 - [x] USB příkazy pro ovládání a stahování dat
 - [x] WS2812B RGB LED indikace stavů
-- [x] Epoch timestamps (synchronizace hodin z PC)
+- [x] Epoch timestamps v µs přesnosti (synchronizace hodin z PC)
 - [x] EMA filtr pro vyhlazení dat
 - [x] Detekce startu a horní úvrati (apogee)
 - [x] Automatická aktivace padáku (GP14)
 - [x] Kalibrace baseline akcelerometru při startu
-- [ ] Vizualizace dat (grafy v PC aplikaci)
+- [x] CLI příkaz `save` – automaticky pojmenovaný CSV z epoch timestamps
+- [x] Vizualizace dat (`samples/plot_flight.py`, matplotlib)
 - [ ] Detekce orientace (gyro integrace)
 - [ ] Logovací mode – filtrovaná data do CSV
 

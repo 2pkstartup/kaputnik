@@ -292,6 +292,16 @@ static void write_header(void) {
     w25q64_page_program(0, (const uint8_t *)&hdr, sizeof(hdr));
 }
 
+/* Vrátí adresu záznamu uloženého ve stránkovaném layoutu flash.
+ * Záznamy se skládají do 256B stránek, konec stránky se doplní 0xFF. */
+static uint32_t flash_record_addr(uint32_t base_addr, uint16_t record_size, uint32_t index) {
+    uint32_t records_per_page = FLASH_PAGE_SIZE / record_size;
+    uint32_t page_index = index / records_per_page;
+    uint32_t index_in_page = index % records_per_page;
+
+    return base_addr + page_index * FLASH_PAGE_SIZE + index_in_page * record_size;
+}
+
 /* =======================================================================
  *  Zpracování USB sériových příkazů
  *
@@ -335,11 +345,11 @@ static void process_command(const char *cmd) {
         printf("# Epoch start: %llu\n", hdr.epoch_ms_start);
         printf("epoch_us,ax,ay,az,gx,gy,gz,gp14,mx,my,mz,mag_valid\n");
 
-        uint32_t addr = FLASH_DATA_START;
         if (hdr.version >= 5) {
             /* v5+: data začínají na sektoru 1 (FLASH_DATA_START = 0x1000) */
             sample_record_t rec;
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
+                uint32_t addr = flash_record_addr(FLASH_DATA_START, sizeof(rec), i);
                 w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
                 uint64_t epoch_us = hdr.epoch_ms_start * 1000ULL + rec.timestamp_us;
                 printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
@@ -349,14 +359,13 @@ static void process_command(const char *cmd) {
                        rec.gp14_state,
                        rec.mx, rec.my, rec.mz,
                        rec.mag_valid);
-                addr += sizeof(rec);
             }
         } else if (hdr.version >= 4) {
             /* v4: data začínají na stránce 1 (adresa 0x100) */
-            uint32_t addr_v4 = FLASH_PAGE_SIZE;
             sample_record_t rec;
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
-                w25q64_read(addr_v4, (uint8_t *)&rec, sizeof(rec));
+                uint32_t addr = flash_record_addr(FLASH_PAGE_SIZE, sizeof(rec), i);
+                w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
                 uint64_t epoch_us = hdr.epoch_ms_start * 1000ULL + rec.timestamp_us;
                 printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
                        epoch_us,
@@ -365,11 +374,11 @@ static void process_command(const char *cmd) {
                        rec.gp14_state,
                        rec.mx, rec.my, rec.mz,
                        rec.mag_valid);
-                addr_v4 += sizeof(rec);
             }
         } else if (hdr.version >= 3) {
             sample_record_v3_t rec;
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
+                uint32_t addr = flash_record_addr(FLASH_PAGE_SIZE, sizeof(rec), i);
                 w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
                 uint64_t epoch_us = hdr.epoch_ms_start * 1000ULL + rec.timestamp_us;
                 printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
@@ -379,11 +388,11 @@ static void process_command(const char *cmd) {
                        rec.gp14_state,
                        0, 0, 0,
                        0u);
-                addr += sizeof(rec);
             }
         } else {
             sample_record_v2_t rec;
             for (uint32_t i = 0; i < hdr.num_samples; i++) {
+                uint32_t addr = flash_record_addr(FLASH_PAGE_SIZE, sizeof(rec), i);
                 w25q64_read(addr, (uint8_t *)&rec, sizeof(rec));
                 uint64_t epoch_us = hdr.epoch_ms_start * 1000ULL + rec.timestamp_us;
                 printf("%llu,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%u\n",
@@ -393,7 +402,6 @@ static void process_command(const char *cmd) {
                        0u,
                        0, 0, 0,
                        0u);
-                addr += sizeof(rec);
             }
         }
         printf("# END\n");

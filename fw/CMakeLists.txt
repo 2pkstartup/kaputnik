@@ -18,9 +18,17 @@ add_executable(kaputnik
     src/ws2812.c
 )
 
+add_executable(kaputnik_imu_usb
+    src/main_imu_usb.c
+    src/imu.c
+    src/ws2812.c
+)
+
 pico_generate_pio_header(kaputnik ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
+pico_generate_pio_header(kaputnik_imu_usb ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
 
 target_include_directories(kaputnik PRIVATE src)
+target_include_directories(kaputnik_imu_usb PRIVATE src)
 
 target_link_libraries(kaputnik
     pico_stdlib
@@ -31,7 +39,19 @@ target_link_libraries(kaputnik
     hardware_pio
 )
 
+target_link_libraries(kaputnik_imu_usb
+    pico_stdlib
+    pico_stdio_usb
+    hardware_spi
+    hardware_gpio
+    hardware_timer
+    hardware_pio
+)
+
 pico_enable_stdio_usb(kaputnik 1)
 pico_enable_stdio_uart(kaputnik 0)
+pico_enable_stdio_usb(kaputnik_imu_usb 1)
+pico_enable_stdio_uart(kaputnik_imu_usb 0)
 
 pico_add_extra_outputs(kaputnik)
+pico_add_extra_outputs(kaputnik_imu_usb)
