@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use serialport::UsbPortInfo;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // =========================================================================
@@ -73,10 +73,19 @@ enum Commands {
 /// Otevře sériový port s daným názvem a rychlostí.
 /// Timeout 5 s – pokud zařízení neodpoví, operace selhá.
 fn open_port(port: &str, baud: u32) -> Result<Box<dyn serialport::SerialPort>> {
-    serialport::new(port, baud)
+    let mut serial = serialport::new(port, baud)
         .timeout(Duration::from_secs(5))
         .open()
-        .with_context(|| format!("Cannot open serial port {port}"))
+        .with_context(|| format!("Cannot open serial port {port}"))?;
+
+    serial
+        .write_data_terminal_ready(true)
+        .with_context(|| format!("Cannot assert DTR on serial port {port}"))?;
+    serial
+        .write_request_to_send(true)
+        .with_context(|| format!("Cannot assert RTS on serial port {port}"))?;
+
+    Ok(serial)
 }
 
 /// Vrátí true, pokud metadata USB portu vypadají jako Kaputnik/RP2040 CDC zařízení.
@@ -162,27 +171,66 @@ fn send_command(port: &mut Box<dyn serialport::SerialPort>, cmd: &str) -> Result
     Ok(())
 }
 
+/// Po otevření CDC portu na RP2040 může dojít k resetu firmware.
+/// Počká na dokončení bootu a odčerpá úvodní banner, aby další příkazy
+/// už šly na připravené zařízení.
+fn settle_port_after_open(port: &mut Box<dyn serialport::SerialPort>) -> Result<()> {
+    std::thread::sleep(Duration::from_millis(2800));
+    port.set_timeout(Duration::from_millis(250))?;
+    let _ = read_lines(port)?;
+    port.set_timeout(Duration::from_secs(5))?;
+    Ok(())
+}
+
+/// Přečte jeden textový řádek přímo ze sériového portu bez klonování handle.
+/// Vrací `None`, pokud během timeoutu nepřišla žádná data.
+fn read_line(port: &mut Box<dyn serialport::SerialPort>) -> Result<Option<String>> {
+    let mut buf = [0u8; 1];
+    let mut line = Vec::new();
+
+    loop {
+        match port.read(&mut buf) {
+            Ok(0) => {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            Ok(_) => match buf[0] {
+                b'\n' => break,
+                b'\r' => {}
+                byte => line.push(byte),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(Some(String::from_utf8_lossy(&line).trim().to_string()))
+}
+
 /// Čte řádky z portu dokud nenarazí na "# END", timeout nebo EOF.
 /// Používá se pro jednoduché příkazy (status, erase, start, stop).
 fn read_lines(port: &mut Box<dyn serialport::SerialPort>) -> Result<Vec<String>> {
-    let mut reader = BufReader::new(port.try_clone()?);
     let mut lines = Vec::new();
-    let mut line = String::new();
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let trimmed = line.trim().to_string();
-                if trimmed == "# END" {
-                    lines.push(trimmed);
+        match read_line(port)? {
+            Some(line) => {
+                if line == "# END" {
+                    lines.push(line);
                     break;
                 }
-                lines.push(trimmed);
+                if !line.is_empty() {
+                    lines.push(line);
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) => return Err(e.into()),
+            None => break,
         }
     }
 
@@ -230,14 +278,13 @@ fn epoch_secs_to_datetime_str(epoch_secs: u64) -> String {
 fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
     let mut port = open_port(port_name, baud)?;
 
+    settle_port_after_open(&mut port)?;
+
     // Set longer timeout for dump (large data)
     port.set_timeout(Duration::from_secs(2))?;
 
     eprintln!("Requesting data dump...");
     send_command(&mut port, "dump")?;
-
-    let mut reader = BufReader::new(port.try_clone()?);
-    let mut line = String::new();
 
     // Parsování hlavičky – řádky začínající '#' jsou komentáře firmware,
     // první řádek bez '#' je CSV hlavička (názvy sloupců)
@@ -247,11 +294,8 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
 
     // Čtení hlavičkových řádků (komentáře # a CSV header)
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => bail!("Connection closed unexpectedly"),
-            Ok(_) => {
-                let trimmed = line.trim().to_string();
+        match read_line(&mut port)? {
+            Some(trimmed) => {
                 if trimmed.starts_with("# Samples:") {
                     if let Some(n) = trimmed.strip_prefix("# Samples:") {
                         total_samples = n.trim().parse().unwrap_or(0);
@@ -263,15 +307,11 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
                     bail!("{trimmed}");
                 }
 
-                // CSV header line (not a comment)
                 if !trimmed.starts_with('#') {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                bail!("Timeout waiting for data");
-            }
-            Err(e) => return Err(e.into()),
+            None => bail!("Timeout waiting for data"),
         }
     }
 
@@ -305,10 +345,8 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
     // Čtení datových řádků CSV až do "# END"
     let mut count: u64 = 0;
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
+        match read_line(&mut port)? {
+            Some(line) => {
                 let trimmed = line.trim();
                 if trimmed == "# END" {
                     writeln!(out, "{trimmed}")?;
@@ -320,8 +358,7 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
                     pb.set_position(count);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) => return Err(e.into()),
+            None => break,
         }
     }
 
@@ -343,10 +380,7 @@ fn cmd_dump(port_name: &str, baud: u32, output: Option<String>) -> Result<()> {
 fn cmd_save(port_name: &str, baud: u32) -> Result<()> {
     let mut port = open_port(port_name, baud)?;
 
-    // Opening CDC serial on RP2040 can reset the firmware; wait for boot banner.
-    std::thread::sleep(Duration::from_millis(2800));
-    port.set_timeout(Duration::from_millis(250))?;
-    let _ = read_lines(&mut port);
+    settle_port_after_open(&mut port)?;
 
     // Stop recording first so the header gets written to flash.
     port.set_timeout(Duration::from_secs(5))?;
@@ -363,19 +397,13 @@ fn cmd_save(port_name: &str, baud: u32) -> Result<()> {
     eprintln!("Requesting data dump...");
     send_command(&mut port, "dump")?;
 
-    let mut reader = BufReader::new(port.try_clone()?);
-    let mut line = String::new();
-
     let mut total_samples: u64 = 0;
     let mut epoch_ms_start: u64 = 0;
     let mut header_lines: Vec<String> = Vec::new();
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => bail!("Connection closed unexpectedly"),
-            Ok(_) => {
-                let trimmed = line.trim().to_string();
+        match read_line(&mut port)? {
+            Some(trimmed) => {
                 if let Some(n) = trimmed.strip_prefix("# Samples:") {
                     total_samples = n.trim().parse().unwrap_or(0);
                 }
@@ -390,10 +418,7 @@ fn cmd_save(port_name: &str, baud: u32) -> Result<()> {
                     break; // CSV header line
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                bail!("Timeout waiting for data");
-            }
-            Err(e) => return Err(e.into()),
+            None => bail!("Timeout waiting for data"),
         }
     }
 
@@ -424,10 +449,8 @@ fn cmd_save(port_name: &str, baud: u32) -> Result<()> {
 
     let mut count: u64 = 0;
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
+        match read_line(&mut port)? {
+            Some(line) => {
                 let trimmed = line.trim();
                 if trimmed == "# END" {
                     writeln!(out, "{trimmed}")?;
@@ -439,8 +462,7 @@ fn cmd_save(port_name: &str, baud: u32) -> Result<()> {
                     pb.set_position(count);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) => return Err(e.into()),
+            None => break,
         }
     }
 
@@ -460,6 +482,7 @@ fn cmd_save(port_name: &str, baud: u32) -> Result<()> {
 
 fn cmd_simple(port_name: &str, baud: u32, cmd: &str) -> Result<()> {
     let mut port = open_port(port_name, baud)?;
+    settle_port_after_open(&mut port)?;
     send_command(&mut port, cmd)?;
 
     let lines = read_lines(&mut port)?;
